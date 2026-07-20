@@ -1,0 +1,14 @@
+# NEVER upload secrets or local-only files
+.env
+.tts-cache
+__pycache__
+server.py
+play.sh
+*.md
+.claude
+
+# 83MB custom player FBX — too heavy for a free-tier deploy (bandwidth!).
+# The game auto-falls back to the built-in Xbot player model when this 404s.
+# To ship it later: compress to a GLB (<10MB) and remove this line.
+web/assets/character.fbx
+node_modules

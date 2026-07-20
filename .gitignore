@@ -1,0 +1,21 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Generated / caches
+.tts-cache/
+__pycache__/
+*.pyc
+node_modules/
+.vercel/
+
+# Local artifacts + editor cruft
+*.log
+tiny-gta-selfie-*.png
+.DS_Store
+
+# 82MB custom player model — kept local, out of git (GitHub rejects/chokes on
+# large binaries). Game falls back to the built-in Xbot player without it.
+# To ship it: use Git LFS or attach it as a Release asset.
+web/assets/character.fbx

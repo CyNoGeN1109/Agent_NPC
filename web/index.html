@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tiny-gta — one house, one living NPC</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #10131c; font-family: -apple-system, "Segoe UI", sans-serif; }
+  canvas { display: block; }
+
+  #boot {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; color: #cfd6e8;
+    background:
+      radial-gradient(1200px 520px at 50% -8%, rgba(255,180,94,.14), transparent 60%),
+      radial-gradient(900px 700px at 50% 118%, rgba(120,90,220,.12), transparent 60%),
+      linear-gradient(#0b0e17, #070910);
+    z-index: 30; transition: opacity .5s; overflow-y: auto; padding: 30px 18px;
+  }
+  #boot .kicker { font-size: 11px; letter-spacing: 5px; text-transform: uppercase;
+                  color: #ff9a6b; opacity: .85; margin-bottom: 6px; }
+  #boot h1 { font-size: clamp(44px, 9vw, 88px); font-weight: 900; letter-spacing: -2px;
+             margin: 0; line-height: .92; text-align: center;
+             background: linear-gradient(180deg, #fff 0%, #ffd479 60%, #ff9a6b 100%);
+             -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+             filter: drop-shadow(0 6px 40px rgba(255,190,110,.28)); }
+  #boot .tag { font-size: clamp(14px, 1.9vw, 17px); color: #d7ddec; max-width: 540px;
+               text-align: center; line-height: 1.5; margin: 14px 0 4px; }
+  #boot .tag b { color: #ffd479; font-weight: 600; }
+  #boot .sub { font-size: 12.5px; opacity: .6; margin-top: 4px; letter-spacing: .3px; }
+  #boot .err { color: #ff9a8a; max-width: 460px; text-align: center; font-size: 13px; }
+
+  /* keycap-legend intro — grouped, compact, game-like (not a card grid) */
+  #guide { display: flex; flex-direction: column; gap: 9px; width: min(620px, 94vw);
+           margin: 22px 0 8px; }
+  #guide .lane { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+                 padding: 11px 15px; border-radius: 12px;
+                 background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.07);
+                 border-left-width: 3px; }
+  #guide .lane.nice  { border-left-color: #5fd68a; }
+  #guide .lane.mean  { border-left-color: #ff8b64; }
+  #guide .lane.chaos { border-left-color: #c58bff; }
+  #guide .lane .who { font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase;
+                      font-weight: 700; min-width: 74px; }
+  #guide .lane.nice  .who { color: #5fd68a; }
+  #guide .lane.mean  .who { color: #ff8b64; }
+  #guide .lane.chaos .who { color: #c58bff; }
+  #guide .acts { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: #b8c1d6; }
+  #guide .acts span { white-space: nowrap; }
+  kbd { font-family: inherit; font-size: 11.5px; font-weight: 700; color: #0c0f18;
+        background: linear-gradient(#fdfefe, #cdd4e4); border-radius: 5px;
+        padding: 1px 6px; box-shadow: 0 1.5px 0 rgba(0,0,0,.45); margin-right: 3px; }
+  #guide .foot { text-align: center; font-size: 12px; color: #8b96b0; margin-top: 6px; line-height: 1.6; }
+  #guide .foot b { color: #ffd479; }
+  @media (max-width: 560px) { #guide .lane { flex-direction: column; gap: 5px; } }
+
+  .overlay { position: fixed; z-index: 10; color: #e8ecf6; pointer-events: none; }
+
+  #hud { left: 14px; bottom: 12px; font-size: 12px; opacity: .75;
+         text-shadow: 0 1px 3px rgba(0,0,0,.8); line-height: 1.6; }
+
+  #status { right: 14px; top: 12px; font-size: 12px; opacity: .8; text-align: right;
+            text-shadow: 0 1px 3px rgba(0,0,0,.8); }
+
+  #prompt { left: 50%; bottom: 18%; transform: translateX(-50%);
+            font-size: 15px; background: rgba(10,14,24,.72); padding: 8px 16px;
+            border-radius: 8px; border: 1px solid rgba(255,255,255,.15); display: none; }
+  #prompt b { color: #ffd479; }
+
+  #bubble { max-width: 320px; background: rgba(16,20,32,.88); border: 1px solid rgba(255,255,255,.18);
+            padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.45;
+            transform: translate(-50%, -100%); display: none; }
+  #bubble .who { color: #ffd479; font-size: 11px; letter-spacing: 1px; margin-bottom: 3px; }
+
+  #chat { position: fixed; z-index: 20; left: 50%; bottom: 24px; transform: translateX(-50%);
+          width: min(560px, 92vw); display: none; flex-direction: column; gap: 8px; }
+  #log { max-height: 34vh; overflow-y: auto; background: rgba(12,16,26,.85);
+         border: 1px solid rgba(255,255,255,.14); border-radius: 12px; padding: 12px 14px;
+         font-size: 13.5px; color: #dfe5f2; line-height: 1.5; }
+  #log .u  { color: #9fd0ff; margin: 6px 0 2px; }
+  #log .n  { color: #ffe2a8; margin: 2px 0 6px; }
+  #log .sys{ color: #8b93a8; font-style: italic; font-size: 12px; }
+  #log pre { background: rgba(0,0,0,.4); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 4px 0; }
+  #log code { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 12.5px; color: #a8e6cf; }
+  #log pre code { display: block; white-space: pre-wrap; }
+  #chatform { display: flex; gap: 8px; }
+  #chatinput { flex: 1; background: rgba(12,16,26,.9); color: #eef2fb;
+               border: 1px solid rgba(255,255,255,.2); border-radius: 10px;
+               padding: 11px 14px; font-size: 14px; outline: none; }
+  #chatinput:focus { border-color: #ffd479; }
+  #chatform button { background: #ffd479; color: #201a08; border: 0; border-radius: 10px;
+                     padding: 0 18px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  #chatform button:disabled { opacity: .5; }
+  #chathint { text-align: center; font-size: 11px; color: #8b93a8; }
+
+  #mic { left: 50%; top: 14%; transform: translateX(-50%); display: none;
+         background: rgba(200,40,40,.85); padding: 10px 20px; border-radius: 24px;
+         font-size: 15px; font-weight: 600; letter-spacing: 1px;
+         box-shadow: 0 0 24px rgba(255,60,60,.5); }
+
+  #moodbar { left: 14px; top: 12px; background: rgba(12,16,26,.78);
+             border: 1px solid rgba(255,255,255,.16); border-radius: 10px;
+             padding: 8px 12px; font-size: 13px; min-width: 168px; }
+  #moodbar .row { display: flex; justify-content: space-between; gap: 10px; }
+  #moodbar .bar { margin-top: 5px; height: 6px; border-radius: 3px; background: rgba(255,255,255,.12); overflow: hidden; }
+  #moodbar .fill { height: 100%; width: 70%; background: #6fd66f; border-radius: 3px;
+                   transition: width .4s, background .4s; }
+
+  #charge { left: 50%; bottom: 26%; transform: translateX(-50%); display: none;
+            width: 130px; height: 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,.35);
+            background: rgba(10,14,24,.6); overflow: hidden; }
+  #chargefill { height: 100%; width: 0%; background: linear-gradient(90deg,#ffd479,#ff5f4a); }
+
+  /* "try this" engagement tips — slide in at the top every few minutes */
+  #tip { position: fixed; z-index: 25; left: 50%; top: 14%; transform: translate(-50%, -14px);
+         max-width: min(540px, 90vw); background: rgba(19,16,34,.94);
+         border: 1px solid rgba(197,139,255,.55); color: #efe6ff;
+         padding: 11px 18px; border-radius: 12px; font-size: 14px; line-height: 1.45;
+         box-shadow: 0 6px 30px rgba(150,90,255,.28); pointer-events: none;
+         opacity: 0; transition: opacity .45s, transform .45s; }
+  #tip.show { opacity: 1; transform: translate(-50%, 0); }
+  #tip .lbl { color: #c58bff; font-weight: 700; letter-spacing: 1.5px; font-size: 11px;
+              text-transform: uppercase; margin-right: 7px; }
+  #tip b { color: #ffd479; }
+
+  #toast { left: 50%; top: 9%; transform: translateX(-50%); display: none;
+           background: rgba(20,26,40,.94); border: 1px solid #ffd479; color: #ffe2a8;
+           padding: 12px 22px; border-radius: 12px; font-size: 15px; font-weight: 600;
+           box-shadow: 0 4px 30px rgba(255,212,121,.25); z-index: 25; }
+
+  #stats, #board, #challenges, #settings {
+           position: fixed; z-index: 26; right: 16px; top: 50%; transform: translateY(-50%);
+           display: none; width: 300px; background: rgba(12,16,26,.95);
+           border: 1px solid rgba(255,255,255,.2); border-radius: 14px; padding: 18px 20px;
+           color: #e8ecf6; font-size: 13.5px; }
+  #board { right: auto; left: 16px; }
+  #challenges { right: auto; left: 50%; top: 50%; transform: translate(-50%,-50%); }
+  #stats h3, #board h3, #challenges h3, #settings h3 {
+           margin: 0 0 12px; font-size: 16px; letter-spacing: 1px; color: #ffd479; }
+  #stats .row, #board .row, #challenges .row, #settings .row {
+           display: flex; justify-content: space-between; align-items: center; padding: 3px 0;
+           border-bottom: 1px dashed rgba(255,255,255,.08); }
+  #stats .total { margin-top: 12px; font-weight: 700; color: #ff9a6b; font-size: 14.5px; }
+  #stats .hint, #board .hint, #challenges .hint, #settings .hint {
+           margin-top: 8px; font-size: 11px; color: #8b93a8; }
+  #settings input[type=range] { width: 130px; accent-color: #ffd479; }
+  #settings input[type=checkbox] { accent-color: #ffd479; width: 17px; height: 17px; }
+  #settings { width: 340px; max-height: 86vh; overflow-y: auto; }
+  #settings .sect { margin: 13px 0 4px; font-size: 11px; letter-spacing: 1.5px;
+                    text-transform: uppercase; color: #ffd479; opacity: .85; }
+  #settings .dangerbtn { background: #b33; color: #fff; border: 0; border-radius: 7px;
+                         padding: 4px 14px; font-size: 12px; font-weight: 700; cursor: pointer;
+                         letter-spacing: 1px; }
+  #settings .dangerbtn:hover { background: #d44; }
+  #settings .keys { margin-top: 12px; font-size: 11px; line-height: 1.9; color: #aab4cc; }
+  #settings .keys b { color: #fff; background: rgba(255,255,255,.08); padding: 0 4px; border-radius: 4px; }
+
+  #moodbar .stage { margin-top: 5px; font-size: 11px; letter-spacing: .5px; color: #9fb0d8; }
+
+  /* cinematic edge-darkening — pure CSS, zero GPU cost */
+  #vig { position: fixed; inset: 0; z-index: 5; pointer-events: none;
+         background: radial-gradient(ellipse at center,
+         rgba(0,0,0,0) 58%, rgba(5,7,14,.38) 100%); }
+
+  /* M4: red vignette when he lands a hit on YOU */
+  #dmg { position: fixed; inset: 0; z-index: 24; pointer-events: none; opacity: 0;
+         transition: opacity .35s; background: radial-gradient(ellipse at center,
+         rgba(0,0,0,0) 55%, rgba(200,30,30,.55) 100%); }
+
+  /* thinking loader floating above his head */
+  #think { transform: translate(-50%, -100%); display: none;
+           background: rgba(16,20,32,.85); border: 1px solid rgba(255,255,255,.22);
+           border-radius: 14px; padding: 6px 13px; font-size: 14px; letter-spacing: 2px; }
+  #think .dot { display: inline-block; animation: thinkblink 1.2s infinite; }
+  #think .dot:nth-child(2) { animation-delay: .2s; }
+  #think .dot:nth-child(3) { animation-delay: .4s; }
+  @keyframes thinkblink { 0%,80%,100% { opacity: .25; } 40% { opacity: 1; } }
+
+  /* selfie flash */
+  #flash { position: fixed; inset: 0; z-index: 28; pointer-events: none; opacity: 0;
+           background: #fff; transition: opacity .5s; }
+
+  #startbtn { margin-top: 18px; background: #ffd479; color: #201a08; border: 0;
+              border-radius: 12px; padding: 14px 46px; font-size: 17px; font-weight: 700;
+              letter-spacing: 3px; cursor: pointer; box-shadow: 0 4px 30px rgba(255,212,121,.35); }
+  #startbtn:hover { transform: scale(1.04); }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/addons/"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="boot">
+    <div class="kicker">one house · one car · one live AI</div>
+    <h1>TINY&#8202;·&#8202;GTA</h1>
+    <div class="tag">His brain is a real language model. He talks back, holds grudges, loves his
+      car, and <b>remembers everything you do to him.</b> Be his friend — or his villain.</div>
+    <div id="guide">
+      <div class="lane nice">
+        <span class="who">Kind</span>
+        <div class="acts">
+          <span><kbd>hold T</kbd> talk / vent</span>
+          <span><kbd>G</kbd> feed a token 🪙</span>
+          <span><kbd>F</kbd> go for a drive 🚗</span>
+          <span><kbd>R</kbd> fix his car 🔧</span>
+        </div>
+      </div>
+      <div class="lane mean">
+        <span class="who">Cruel</span>
+        <div class="acts">
+          <span><kbd>hold click</kbd> punch 👊</span>
+          <span><kbd>Q</kbd> throw tomatoes 🍅</span>
+          <span><kbd>P</kbd> pluck his flowers 🌸</span>
+          <span>crash the car 💥</span>
+        </div>
+      </div>
+      <div class="lane chaos">
+        <span class="who">Chaos</span>
+        <div class="acts">
+          <span>break him → 👻 psycho mode</span>
+          <span>7 hits → 💥 he reboots</span>
+          <span>push him → 🪧 he strikes back</span>
+          <span>ask him to dance, anything</span>
+        </div>
+      </div>
+      <div class="foot">
+        <kbd>WASD</kbd> move · <kbd>E</kbd> type · <kbd>J</kbd> chores · <kbd>C</kbd> challenges ·
+        <kbd>Tab</kbd> receipt · <kbd>O</kbd> settings &nbsp;—&nbsp; choose wisely. <b>(or don't.)</b>
+      </div>
+    </div>
+    <div class="sub" id="bootmsg">loading world…</div>
+    <div class="err" id="booterr"></div>
+  </div>
+
+  <div id="hud" class="overlay">
+    <b>WASD</b> move &nbsp;·&nbsp; <b>Shift</b> run &nbsp;·&nbsp; <b>Space</b> jump
+    &nbsp;·&nbsp; <b>hold T</b> talk 🎙️ &nbsp;·&nbsp; <b>E</b> type 💬
+    &nbsp;·&nbsp; <b>hold click</b> punch &nbsp;·&nbsp; <b>Q</b> tomato 🍅
+    &nbsp;·&nbsp; <b>G</b> feed 🪙 &nbsp;·&nbsp; <b>P</b> pluck 🌸 &nbsp;·&nbsp; <b>F</b> car 🚗 &nbsp;·&nbsp; <b>R</b> repair 🔧
+    &nbsp;·&nbsp; <b>J</b> chores 📋 &nbsp;·&nbsp; <b>C</b> challenges 🎯
+    &nbsp;·&nbsp; <b>Tab</b> receipt 🧾 &nbsp;·&nbsp; <b>O</b> settings ⚙️
+  </div>
+  <div id="status" class="overlay">…</div>
+  <div id="moodbar" class="overlay">
+    <div class="row"><span id="moodface">🙂 <span id="moodname">Agent</span></span><span id="moodnum">7/10 · 🪙0</span></div>
+    <div class="bar"><div class="fill" id="moodfill"></div></div>
+    <div class="stage" id="stage"></div>
+  </div>
+  <div id="vig"></div>
+  <div id="dmg"></div>
+  <div id="board"></div>
+  <div id="challenges"></div>
+  <div id="settings"></div>
+  <div id="mic" class="overlay">● listening… release T to send</div>
+  <div id="charge" class="overlay"><div id="chargefill"></div></div>
+  <div id="toast" class="overlay"></div>
+  <div id="tip"></div>
+  <div id="stats"></div>
+  <div id="prompt" class="overlay">Hold <b>T</b> to talk</div>
+  <div id="think" class="overlay">💭 <span class="dot">●</span><span class="dot">●</span><span class="dot">●</span></div>
+  <div id="flash"></div>
+  <div id="bubble" class="overlay"><div class="who"></div><div class="txt"></div></div>
+
+  <div id="chat">
+    <div id="log"></div>
+    <form id="chatform">
+      <input id="chatinput" autocomplete="off" placeholder="Say something…" />
+      <button id="chatsend" type="submit">Say</button>
+    </form>
+    <div id="chathint">Enter to send · Esc to walk away</div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
