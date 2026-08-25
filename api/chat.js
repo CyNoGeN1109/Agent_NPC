@@ -1,5 +1,5 @@
-// Vercel serverless /chat — OpenRouter proxy with the same fallback chain and
-// reply sanitizer as server.py, so one client works locally AND deployed.
+// Vercel serverless /chat — Sarvam/OpenRouter proxy with the same fallback
+// chain and reply sanitizer as server.py, so one client works locally AND deployed.
 // Zero npm dependencies (Node 18+ built-in fetch).
 //
 // Abuse protection (this is a public, key-spending endpoint):
@@ -9,7 +9,14 @@
 //   - global per-instance limit: 40 req/min protects the free-tier key
 //   - strict input caps: message count, per-message and total length
 
-const MODEL = process.env.OPENROUTER_MODEL || 'tencent/hy3:free';
+const SARVAM_KEY = process.env.SARVAM_API_KEY || '';
+const SARVAM_URL = (process.env.SARVAM_URL || 'https://api.sarvam.ai/v1').replace(/\/$/, '');
+const SARVAM_MODEL = process.env.SARVAM_MODEL || 'sarvam-105b-conversations';
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || '';
+const BACKEND = process.env.NPC_BACKEND || (SARVAM_KEY ? 'sarvam' : 'openrouter');
+const MODEL = BACKEND === 'sarvam'
+  ? (process.env.NPC_MODEL || SARVAM_MODEL)
+  : (process.env.NPC_MODEL || process.env.OPENROUTER_MODEL || 'tencent/hy3:free');
 // rotate small/fast free models so a 429 on one falls straight through to the
 // next. (All :free models share one daily cap; when it's exhausted the whole
 // chain 429s — only credits/paid/local-Ollama help then.) No giants.
@@ -68,6 +75,9 @@ function limited(ip) {
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
+  if (!['sarvam', 'openrouter'].includes(BACKEND)) {
+    return res.status(503).json({ error: `unsupported Vercel backend: ${BACKEND}` });
+  }
   const host = req.headers.host || '';
   const origin = req.headers.origin || req.headers.referer || '';
   if (!host || !origin.includes(host)) return res.status(403).json({ error: 'forbidden' });
@@ -75,8 +85,8 @@ module.exports = async (req, res) => {
   const limitMsg = limited(ip);
   if (limitMsg) return res.status(429).json({ error: limitMsg });
 
-  const key = process.env.OPENROUTER_API_KEY;
-  if (!key) return res.status(503).json({ error: 'no OPENROUTER_API_KEY configured' });
+  const key = BACKEND === 'sarvam' ? SARVAM_KEY : OPENROUTER_KEY;
+  if (!key) return res.status(503).json({ error: `no ${BACKEND.toUpperCase()} API key configured` });
 
   let messages = req.body?.messages;
   if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: 'messages required' });
@@ -92,7 +102,9 @@ module.exports = async (req, res) => {
   if (total > 60000) return res.status(413).json({ error: 'history too large' });
   messages = messages.map((m) => ({ role: m.role, content: m.content })); // strip extras
 
-  const chain = [MODEL, ...FALLBACKS.filter((m) => m !== MODEL)];
+  const chain = BACKEND === 'sarvam'
+    ? [MODEL]
+    : [MODEL, ...FALLBACKS.filter((m) => m !== MODEL)];
   let lastErr = 'no models tried';
   for (let ci = 0; ci < chain.length; ci++) {
     const m = chain[ci];
@@ -104,15 +116,23 @@ module.exports = async (req, res) => {
     if (ci === chain.length - 1) attempts.push(base); // last resort: unconstrained
     for (const payload of attempts) {
       try {
-        const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        const endpoint = BACKEND === 'sarvam'
+          ? `${SARVAM_URL}/chat/completions`
+          : 'https://openrouter.ai/api/v1/chat/completions';
+        const headers = BACKEND === 'sarvam'
+          ? { 'Content-Type': 'application/json', 'api-subscription-key': key }
+          : { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, 'X-Title': 'tiny-gta' };
+        const r = await fetch(endpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, 'X-Title': 'tiny-gta' },
+          headers,
           body: JSON.stringify(payload),
           signal: AbortSignal.timeout(18000),
         });
         if (!r.ok) {
           lastErr = `${m} HTTP ${r.status}`;
-          if (r.status === 401 || r.status === 402) return res.status(502).json({ error: lastErr });
+          if (r.status === 401 || r.status === 402 || (BACKEND === 'sarvam' && r.status === 403)) {
+            return res.status(502).json({ error: lastErr });
+          }
           break; // rate-limited/unsupported → next model
         }
         const data = await r.json();
