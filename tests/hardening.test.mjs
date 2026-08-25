@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { coalesceOverflow, enqueueBounded, isSupportedAction, restoreHistory } from '../web/brain-utils.mjs';
-import { normalizeMemory, storageJson, storageSet } from '../web/storage-utils.mjs';
+import { normalizeMemory, normalizeSettings, storageJson, storageSet } from '../web/storage-utils.mjs';
 import { escapeHtml, renderLongReply } from '../web/text-render.mjs';
 import { modalShortcut } from '../web/ui-guards.mjs';
 
@@ -96,6 +96,43 @@ test('malformed and blocked storage values fall back without throwing', () => {
   };
   assert.deepEqual(storageJson(blocked, 'tiny-gta-ach', []), []);
   assert.equal(storageSet(blocked, 'tiny-gta-ach', '[]'), false);
+});
+
+test('voice setting persists without mutating unrelated settings', () => {
+  const values = new Map();
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+  };
+  const key = 'tiny-gta-settings';
+  const defaults = normalizeSettings(storageJson(storage, key, {}));
+  assert.equal(defaults.voice, true);
+
+  const saved = { ...defaults, volume: 0.35, sens: 1.4, fancy: true, voice: false };
+  assert.equal(storageSet(storage, key, JSON.stringify(saved)), true);
+  const reloadedOff = normalizeSettings(storageJson(storage, key, {}));
+  assert.equal(reloadedOff.voice, false);
+  assert.deepEqual(
+    { volume: reloadedOff.volume, sens: reloadedOff.sens, fancy: reloadedOff.fancy },
+    { volume: 0.35, sens: 1.4, fancy: true },
+  );
+
+  reloadedOff.voice = true;
+  assert.equal(storageSet(storage, key, JSON.stringify(reloadedOff)), true);
+  const reloadedOn = normalizeSettings(storageJson(storage, key, {}));
+  assert.equal(reloadedOn.voice, true);
+  assert.deepEqual(
+    { volume: reloadedOn.volume, sens: reloadedOn.sens, fancy: reloadedOn.fancy },
+    { volume: 0.35, sens: 1.4, fancy: true },
+  );
+
+  for (let i = 0; i < 3; i++) {
+    assert.equal(storageSet(storage, key, JSON.stringify(reloadedOn)), true);
+    assert.deepEqual(normalizeSettings(storageJson(storage, key, {})), reloadedOn);
+  }
+
+  const malformed = { getItem: () => '{not-json' };
+  assert.equal(normalizeSettings(storageJson(malformed, key, {})).voice, true);
 });
 
 test('failed chat turns are removed while prior successful turns survive', () => {

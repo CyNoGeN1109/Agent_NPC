@@ -62,3 +62,16 @@ export function normalizeMemory(raw, fallbackFirstSeen = new Date().toISOString(
     diary,
   };
 }
+
+export function normalizeSettings(raw) {
+  const base = { volume: 1, sens: 1, fancy: true, voice: true };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base;
+  const clamp = (value, min, max, fallback) => Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value)) : fallback;
+  return {
+    volume: clamp(raw.volume, 0, 1, base.volume),
+    sens: clamp(raw.sens, 0.4, 2, base.sens),
+    fancy: raw.fancy === true,
+    voice: raw.voice !== false,
+  };
+}
