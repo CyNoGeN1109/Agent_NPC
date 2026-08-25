@@ -7,6 +7,12 @@ function appendTextWithBreaks(parent, text, doc) {
   });
 }
 
+export function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
 export function renderLongReply(text, displayName, doc = globalThis.document) {
   const div = doc.createElement('div');
   div.className = 'n';
