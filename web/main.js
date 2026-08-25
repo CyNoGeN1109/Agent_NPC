@@ -15,6 +15,10 @@ import {
 import { coalesceOverflow, enqueueBounded, isSupportedAction, restoreHistory } from './brain-utils.mjs';
 import { escapeHtml, renderLongReply } from './text-render.mjs';
 import { modalShortcut } from './ui-guards.mjs';
+import {
+  isSupportedPetCommand, normalizePetState, petAssetFallback, petReaction,
+  petRecovery, serializePetState, setPetMood, setPetRuntimeState, transitionPet,
+} from './pet-controller.mjs';
 
 // ---------------------------------------------------------------- config ---
 const CFG = {
@@ -28,6 +32,9 @@ const CFG = {
   npcRadius: 0.35,
   talkRange: 3.4,
   punchRange: 1.9,
+  petWalk: 2.8,
+  petRun: 4.8,
+  petRadius: 0.24,
   gravity: -14,
   // If a character walks backwards, flip its offset by Math.PI.
   modelYaw: { player: 0, npc: Math.PI }, // player=Xbot(+Z), npc=Soldier(-Z)
@@ -73,6 +80,7 @@ bubbleEl.querySelector('.who').textContent = NPC_NAME.toUpperCase();
 const chatEl = $('chat'), logEl = $('log'), chatForm = $('chatform'),
       chatInput = $('chatinput'), chatSend = $('chatsend');
 const chargeEl = $('charge'), chargeFillEl = $('chargefill'), thinkBubbleEl = $('think');
+const petBarEl = $('petbar');
 
 // ------------------------------------------------------------- renderer ---
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -1208,8 +1216,47 @@ function capsuleFallback(color, yawOffset) {
   return { group, inner: model, yawOffset, anim: new CharacterAnim(model, []) };
 }
 
+function inspectPetAsset(gltf) {
+  const result = {
+    available: true, fallback: false, embeddedTextures: false, textures: 0,
+    skeleton: false, bones: 0, animations: [], triangles: 0, dimensions: [0, 0, 0],
+    orientation: 'unknown',
+  };
+  const box = new THREE.Box3().setFromObject(gltf.scene);
+  const size = box.getSize(new THREE.Vector3());
+  result.dimensions = [size.x, size.y, size.z].map((n) => Number(n.toFixed(3)));
+  const imageDefs = gltf.parser?.json?.images || [];
+  result.embeddedTextures = imageDefs.length > 0 && imageDefs.every((image) => image.bufferView !== undefined || String(image.uri || '').startsWith('data:'));
+  gltf.scene.traverse((obj) => {
+    if (obj.isBone) { result.skeleton = true; result.bones++; }
+    if (obj.isMesh || obj.isSkinnedMesh) {
+      const geometry = obj.geometry;
+      const indexCount = geometry?.index?.count || geometry?.attributes?.position?.count || 0;
+      result.triangles += Math.floor(indexCount / 3);
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+      mats.forEach((mat) => { if (mat?.map) result.textures++; });
+    }
+  });
+  result.animations = (gltf.animations || []).map((clip) => String(clip.name || 'unnamed').slice(0, 64));
+  // A near-square footprint is common for a stylized pet. Keep the value as a
+  // diagnostic; the configurable yaw remains the safe runtime choice.
+  result.orientation = `calibrated local -Z → game +Z (yaw ${PET_ASSET_CONFIG.modelYaw.toFixed(2)})`;
+  result.calibratedYaw = PET_ASSET_CONFIG.modelYaw;
+  return result;
+}
+
+function petAssetLog() {
+  if (petAssetDiagnostics.fallback) {
+    logLine('sys', `(pet asset fallback: ${petAssetDiagnostics.reason}; place the downloaded GLB at web/assets/chopper.glb)`);
+    return;
+  }
+  const d = petAssetDiagnostics;
+  logLine('sys', `(pet asset loaded: ${d.triangles.toLocaleString()} triangles; ${d.embeddedTextures ? 'embedded' : 'external'} textures; ${d.skeleton ? `${d.bones} bones` : 'no skeleton'}; animations: ${d.animations.length ? d.animations.join(', ') : 'none'}; orientation ${d.orientation})`);
+}
+
 // ------------------------------------------------------------- entities ---
-let player, npc;
+let player, npc, pet;
+let petAssetDiagnostics = { available: false, fallback: true, reason: 'not loaded' };
 
 const keys = {};
 let camYaw = Math.PI, camPitch = 0.28;
@@ -1282,6 +1329,23 @@ function saveMemory() {
   storageSet(browserStorage, MEM_KEY, JSON.stringify(memory));
 }
 saveMemory();
+
+// ----------------------------------------------------------- pet state ---
+// Only this minimal shape is persisted. Position, route, animation, and car
+// occupancy are runtime state and are intentionally rebuilt on every load.
+const PET_KEY = 'tiny-gta-pet';
+let petControllerState = normalizePetState(storageJson(browserStorage, PET_KEY, null));
+function savePetState() {
+  storageSet(browserStorage, PET_KEY, JSON.stringify(serializePetState(petControllerState)));
+}
+savePetState();
+
+function updatePetBar() {
+  if (!petBarEl || !petControllerState) return;
+  const state = petControllerState.inCar ? 'car' : petControllerState.state;
+  const hint = petControllerState.visible ? 'B dismiss · chat “stay/come”' : 'B summon';
+  petBarEl.textContent = `🐾 ${petControllerState.name} · ${state} · ${petControllerState.mood} · ${hint}`;
+}
 
 // Wipe everything he remembers about you — memory, diary, achievements, chat
 // history, chore board, unlocked achievements. Keeps your prefs (volume etc.).
@@ -2086,6 +2150,7 @@ function toggleCar() {
       dropPassenger();
       sendEvent('[event] The ride is over — you both hopped out of the Falcon. Say something about the trip you just had together.');
     }
+    if (petControllerState.inCar) petExitCar();
     return;
   }
   if (chatOpen) return;
@@ -2110,6 +2175,11 @@ function toggleCar() {
     logLine('sys', `You got in the Falcon with ${npcDisplayName} riding shotgun.`);
   } else {
     logLine('sys', 'You took the Falcon out for a spin.');
+  }
+  if (petControllerState.visible && !petControllerState.inCar &&
+      pet.group.position.distanceTo(falconGroup.position) < 4.8 &&
+      petControllerState.state !== 'idle') {
+    petEnterCar();
   }
 }
 function carSound(on) {
@@ -2307,6 +2377,7 @@ function throwTomato() {
   tomatoes.push({ mesh, vel: look.multiplyScalar(14).add(new THREE.Vector3(0, 1.2, 0)) });
   whooshSound();
   stats.tomatoes++;
+  petReact('tomato');
 }
 function splatSound() {
   if (!audioCtx || !stepBuf) return;
@@ -2437,6 +2508,7 @@ function saveSettings() {
   storageSet(browserStorage, 'tiny-gta-settings', JSON.stringify(settings));
 }
 let audioCtx = null, stepBuf = null, masterGain = null;
+let chopperIntroAudio = null;
 function initAudio() {
   if (audioCtx) return;
   try {
@@ -2466,6 +2538,27 @@ function initAudio() {
     const sd = stepBuf.getChannelData(0);
     for (let i = 0; i < slen; i++) sd[i] = (Math.random() * 2 - 1) * (1 - i / slen) ** 2;
   } catch { /* no audio, no problem */ }
+}
+function playChopperIntroduction() {
+  try {
+    if (!chopperIntroAudio) {
+      chopperIntroAudio = new Audio('./assets/chopper.mp3');
+      chopperIntroAudio.preload = 'auto';
+      chopperIntroAudio.addEventListener('error', () => {
+        logLine('sys', '(Chopper introduction audio is unavailable; the pet can still play normally.)');
+      }, { once: true });
+    } else {
+      chopperIntroAudio.pause();
+      chopperIntroAudio.currentTime = 0;
+    }
+    chopperIntroAudio.volume = Math.max(0, Math.min(1, Number(settings.volume) || 0.7));
+    const playback = chopperIntroAudio.play();
+    if (playback?.catch) playback.catch(() => {
+      logLine('sys', '(Chopper introduction audio was blocked by the browser; enable sound and summon him again.)');
+    });
+  } catch {
+    logLine('sys', '(Chopper introduction audio could not start; the pet can still play normally.)');
+  }
 }
 function footstep(run) {
   if (!audioCtx || !stepBuf) return;
@@ -2970,6 +3063,24 @@ const COMMAND_MAP = [
   { re: /\bselfie|(take\s+(a\s+)?)?photo\s+(kheecho?|lo)|फोटो|सेल्फी/i, action: 'selfie' },
 ];
 
+// Pet intent is parsed before the NPC command mapper and never enters the
+// model action protocol. The controller is the only authority that executes it.
+const PET_COMMAND_MAP = [
+  { re: /\b(summon|call)\s+(the\s+)?(pet|chopper)\b|chopper\s+aa/i, action: 'summon' },
+  { re: /\b(dismiss|send\s+(the\s+)?(pet|chopper)\s+away)\b/i, action: 'dismiss' },
+  { re: /\b(pet|chopper)\s+(follow|come|stay)\b/i, action: (text) => text.match(/\b(follow|come|stay)\b/i)[1].toLowerCase() },
+  { re: /\b(wait|stay)\s+(by|beside|near)\s+(the\s+)?(car|falcon)\b/i, action: 'wait_car' },
+  { re: /\b(pet|chopper)\s+(ride|enter|go)\s+(in\s+)?(the\s+)?(car|falcon)\b|\b(chopper|pet)\s+come\s+along/i, action: 'enter_car' },
+  { re: /\b(pet|chopper)\s+(exit|leave)\s+(the\s+)?(car|falcon)\b/i, action: 'exit_car' },
+];
+
+function petCommandFromText(text) {
+  for (const cmd of PET_COMMAND_MAP) {
+    if (cmd.re.test(text)) return typeof cmd.action === 'function' ? cmd.action(text) : cmd.action;
+  }
+  return null;
+}
+
 // "jump 4 times" / "jump twice" / "chaar baar kood" → jump:<n>
 const NUM_WORDS = { two: 2, twice: 2, three: 3, thrice: 3, four: 4, five: 5, do: 2, teen: 3, chaar: 4, char: 4, paanch: 5, 'दो': 2, 'तीन': 3, 'चार': 4, 'पांच': 5, 'पाँच': 5 };
 function commandFromText(text) {
@@ -2981,7 +3092,7 @@ function commandFromText(text) {
     if (n >= 2) return `jump:${Math.min(n, 8)}`;
   }
   for (const cmd of COMMAND_MAP) {
-    if (cmd.re.test(text)) return cmd.action;
+    if (cmd.re.test(text)) return typeof cmd.action === 'function' ? cmd.action(text) : cmd.action;
   }
   return null;
 }
@@ -3102,6 +3213,9 @@ async function sendToBrain(text, _lastUserText) {
   statusEl.textContent = `${displayName} is thinking…`;
   chatSend.disabled = true;
   const userText = _lastUserText || text;
+  const petCommand = text.startsWith('[') ? null : petCommandFromText(userText);
+  if (petCommand) applyPetCommand(petCommand);
+  if (!text.startsWith('[')) petReact('chat');
   const historyBeforeTurn = history.slice();
   let turnSucceeded = false;
   history.push({ role: 'user', content: `${observation()}\n${text}` });
@@ -3127,7 +3241,7 @@ async function sendToBrain(text, _lastUserText) {
     // user clearly commanded an action, force it… unless he's genuinely
     // miserable (happiness < 2), in which case the refusal STANDS and the
     // player must bribe (G) or slap (click) to get compliance. That's the game.
-    let commanded = commandFromText(userText);
+    let commanded = petCommand ? null : commandFromText(userText);
     // psycho mode: nothing gets through — he doesn't do tricks anymore
     if (commanded && performance.now() < psycho.until) {
       commanded = null;
@@ -3238,6 +3352,265 @@ function carSpot() {
     falconGroup.position.x - Math.cos(h) * 1.7,
     falconGroup.position.z + Math.sin(h) * 1.7,
   );
+}
+
+const petRuntime = {
+  route: [], finalTarget: null, after: null, stuckAcc: 0, stuckCount: 0,
+  lastPos: new THREE.Vector3(), followAge: 9, nextMoveReaction: 0, sleepyAcc: 0,
+};
+const petPresentation = { phase: 0 };
+
+// Chopper's imported model was visually calibrated in the game camera: its
+// local forward axis points toward -Z, while the world movement convention is
+// +Z. Keep this transform explicit so movement code never has to guess.
+const PET_ASSET_CONFIG = Object.freeze({ modelYaw: Math.PI, scale: 0.58 });
+
+function persistPetControllerState() {
+  savePetState();
+  updatePetBar();
+  if (globalThis.__petDiagnostics) {
+    globalThis.__petDiagnostics = {
+      ...globalThis.__petDiagnostics,
+      state: serializePetState(petControllerState),
+      runtime: {
+        state: petControllerState.inCar ? 'car' : petControllerState.state,
+        mood: petControllerState.mood,
+        visible: petControllerState.visible,
+        groupYaw: pet?.group?.rotation?.y ?? null,
+        modelYaw: PET_ASSET_CONFIG.modelYaw,
+      },
+    };
+  }
+}
+
+function petSetRoute(targetXZ, after = null, state = 'follow', goal = after || '') {
+  if (!pet?.group) return;
+  const clear = findClearNear(targetXZ[0], targetXZ[1]);
+  petRuntime.route = routeTo(pet.group.position, clear[0], clear[1]);
+  petRuntime.finalTarget = clear;
+  petRuntime.after = after;
+  petControllerState = setPetRuntimeState(petControllerState, state, goal);
+  petRuntime.sleepyAcc = 0;
+  petRuntime.stuckAcc = 0;
+  petRuntime.stuckCount = 0;
+  updatePetBar();
+}
+
+function petMoveToward(target, speed, dt) {
+  const dir = new THREE.Vector3(target.x - pet.group.position.x, 0, target.z - pet.group.position.z);
+  const dist = dir.length();
+  if (dist < 0.05) return 0;
+  dir.normalize();
+  const px = pet.group.position.x, pz = pet.group.position.z;
+  if (pointHits(px + dir.x * 0.45, pz + dir.z * 0.45, CFG.petRadius + 0.03)) {
+    const base = Math.atan2(dir.x, dir.z);
+    for (const off of [0.6, -0.6, 1.1, -1.1, 1.6, -1.6]) {
+      const a = base + off, dx = Math.sin(a), dz = Math.cos(a);
+      if (!pointHits(px + dx * 0.45, pz + dz * 0.45, CFG.petRadius + 0.03)) {
+        dir.set(dx, 0, dz); break;
+      }
+    }
+  }
+  pet.group.position.addScaledVector(dir, Math.min(speed * dt, dist));
+  petFaceToward({ x: pet.group.position.x + dir.x, z: pet.group.position.z + dir.z }, dt);
+  return dist;
+}
+
+function petFaceToward(target, dt = 1 / 60) {
+  if (!pet?.group || !target) return;
+  const dx = target.x - pet.group.position.x;
+  const dz = target.z - pet.group.position.z;
+  if (Math.abs(dx) + Math.abs(dz) < 0.001) return;
+  const want = Math.atan2(dx, dz);
+  let dy = Math.atan2(Math.sin(want - pet.group.rotation.y), Math.cos(want - pet.group.rotation.y));
+  pet.group.rotation.y += dy * Math.min(1, dt * 12);
+}
+
+function petAdvanceRoute(speed, dt) {
+  const wp = petRuntime.route[0];
+  if (!wp) return true;
+  const dist = petMoveToward(wp, speed, dt);
+  if (dist < 0.4) petRuntime.route.shift();
+  return petRuntime.route.length === 0;
+}
+
+function petEnterCar() {
+  if (!pet?.group || !petControllerState.visible || !car.inCar) return false;
+  petControllerState = setPetRuntimeState(petControllerState, 'car');
+  petControllerState.inCar = true;
+  petControllerState.relationship.rides++;
+  petRuntime.route = [];
+  petRuntime.after = null;
+  pet.group.visible = true;
+  pet.anim.gestureUntil = 0;
+  persistPetControllerState();
+  showPetBubble('Chopper hops into the Falcon.', 2.5);
+  return true;
+}
+
+function petExitCar() {
+  if (!petControllerState.inCar || !pet?.group) return;
+  petControllerState = setPetRuntimeState(petControllerState, 'stay');
+  petControllerState.inCar = false;
+  const [x, z] = findClearNear(falconGroup.position.x - 2.5, falconGroup.position.z);
+  pet.group.position.set(x, 0, z);
+  pet.group.visible = true;
+  persistPetControllerState();
+}
+
+function applyPetCommand(command) {
+  if (!isSupportedPetCommand(command)) {
+    logLine('sys', `(ignored unsupported pet command: ${String(command || 'empty').slice(0, 48)})`);
+    return false;
+  }
+  if (!pet?.group) return false;
+  const result = transitionPet(petControllerState, command);
+  if (!result.accepted) {
+    logLine('sys', `(pet command rejected: ${result.reason})`);
+    return false;
+  }
+  petControllerState = result.state;
+  const now = performance.now();
+  switch (command) {
+    case 'summon': {
+      // Put the first summon at camera-right so the companion is visible
+      // immediately instead of spawning directly behind the player model.
+      const side = new THREE.Vector3(Math.cos(camYaw), 0, -Math.sin(camYaw));
+      const [x, z] = findClearNear(player.group.position.x + side.x * 1.35, player.group.position.z + side.z * 1.35);
+      pet.group.position.set(x, 0, z); pet.group.visible = true;
+      petFaceToward(player.group.position, 1);
+      petRuntime.route = []; petRuntime.after = null; petRuntime.followAge = 9; petRuntime.sleepyAcc = 0;
+      break;
+    }
+    case 'dismiss':
+      if (petControllerState.inCar) petExitCar();
+      pet.group.visible = false; petRuntime.route = []; petRuntime.after = null;
+      break;
+    case 'follow': petRuntime.route = []; petRuntime.followAge = 9; petRuntime.sleepyAcc = 0; break;
+    case 'stay': petRuntime.route = []; petRuntime.sleepyAcc = 0; break;
+    case 'come': {
+      const dir = new THREE.Vector3().subVectors(pet.group.position, player.group.position).setY(0);
+      if (dir.lengthSq() < 0.2) dir.set(1, 0, 0);
+      dir.normalize();
+      petSetRoute([player.group.position.x + dir.x * 1.25, player.group.position.z + dir.z * 1.25], null, 'follow', 'come');
+      break;
+    }
+    case 'wait_car': petSetRoute(carSpot(), 'wait_car', 'stay', 'wait_car'); break;
+    case 'enter_car':
+      if (car.inCar && pet.group.position.distanceTo(falconGroup.position) < 4.8) petEnterCar();
+      else petSetRoute(carSpot(), 'enter_car', 'stay', 'enter_car');
+      break;
+    case 'exit_car': petExitCar(); break;
+    default: break;
+  }
+  if (command !== 'dismiss') pet.group.visible = petControllerState.visible;
+  persistPetControllerState();
+  if (command === 'summon') {
+    playChopperIntroduction();
+    showPetBubble('Chopper bounds over, ready to follow.', 3);
+  }
+  else if (command === 'dismiss') logLine('sys', '(Chopper trots off for a little break.)');
+  else if (command === 'stay') showPetBubble('Chopper sits and stays.', 2.5);
+  else if (command === 'come') showPetBubble('Chopper comes running.', 2.5);
+  return true;
+}
+
+let petBubbleUntil = 0;
+function showPetBubble(text, secs = 3) {
+  if (!pet?.group || !petControllerState.visible) return;
+  petBubbleUntil = performance.now() + secs * 1000;
+  bubbleUntil = petBubbleUntil;
+  // The shared bubble is textContent-only; no model or persisted string enters HTML.
+  bubbleTxt.textContent = text;
+  bubbleEl.style.display = 'block';
+  bubbleEl.querySelector('.who').textContent = petControllerState.name.toUpperCase();
+}
+
+function petReact(event, detail = '') {
+  const result = petReaction(petControllerState, event, detail);
+  petControllerState = setPetMood(result.state, result.state.mood);
+  if (result.line) showPetBubble(result.line, 2.4);
+  persistPetControllerState();
+}
+
+function updatePetCar() {
+  if (!pet?.group || !petControllerState.inCar) return;
+  const c = Math.cos(car.heading), s = Math.sin(car.heading);
+  pet.group.position.set(
+    falconGroup.position.x + c * 0.34 + s * -0.72,
+    0.42,
+    falconGroup.position.z - s * 0.34 + c * -0.72,
+  );
+  pet.group.rotation.y = car.heading;
+}
+
+function updatePet(dt) {
+  if (!pet?.group || !petControllerState.visible || petControllerState.inCar) return;
+  const now = performance.now();
+  const pPos = player.group.position;
+  const dToPlayer = pet.group.position.distanceTo(pPos);
+  let moving = false;
+  let speed = CFG.petWalk;
+  if (petControllerState.state === 'follow' && petControllerState.goal !== 'come') {
+    petRuntime.followAge += dt;
+    if (dToPlayer > 2.0) {
+      if (segClear(pet.group.position.x, pet.group.position.z, pPos.x, pPos.z)) petRuntime.route = [];
+      else if (!petRuntime.route.length || petRuntime.followAge > 1.5) {
+        petRuntime.finalTarget = [pPos.x, pPos.z];
+        petRuntime.route = routeTo(pet.group.position, pPos.x, pPos.z); petRuntime.followAge = 0;
+      }
+      speed = dToPlayer > 6 ? CFG.petRun : CFG.petWalk;
+      if (petRuntime.route.length) petAdvanceRoute(speed, dt); else petMoveToward(pPos, speed, dt);
+      moving = true;
+    }
+  } else if (petRuntime.route.length && ['come', 'wait_car', 'enter_car'].includes(petControllerState.goal)) {
+    moving = true;
+    const arrived = petAdvanceRoute(CFG.petRun, dt);
+    if (arrived) {
+      if (petRuntime.after === 'enter_car' && car.inCar && pet.group.position.distanceTo(falconGroup.position) < 4.8) petEnterCar();
+      else if (petRuntime.after === 'enter_car') petControllerState = setPetRuntimeState(petControllerState, 'stay', 'wait_car');
+      petRuntime.after = null;
+      if (petControllerState.goal === 'come') petControllerState = setPetRuntimeState(petControllerState, 'stay');
+      persistPetControllerState();
+    }
+  }
+  if (moving) {
+    petRuntime.stuckAcc += dt;
+    if (petRuntime.stuckAcc >= 0.9) {
+      const moved = pet.group.position.distanceTo(petRuntime.lastPos);
+      const recovery = petRecovery({ distance: dToPlayer, stuckSeconds: moved < 0.16 ? petRuntime.stuckAcc : 0, state: petControllerState.state });
+      if (recovery === 'reroute' && petRuntime.finalTarget) {
+        petRuntime.stuckCount++;
+        if (petRuntime.stuckCount > 2) {
+          petControllerState = setPetRuntimeState(petControllerState, 'stay'); petRuntime.route = [];
+        } else {
+          petRuntime.route = routeTo(pet.group.position, petRuntime.finalTarget[0], petRuntime.finalTarget[1]);
+          petRuntime.followAge = 0;
+        }
+      } else if (recovery === 'come') {
+        petRuntime.route = routeTo(pet.group.position, pPos.x, pPos.z); petRuntime.followAge = 0;
+      }
+      petRuntime.stuckAcc = 0; petRuntime.lastPos.copy(pet.group.position);
+    }
+  } else petRuntime.lastPos.copy(pet.group.position);
+  if (!moving && petControllerState.state === 'stay' && !petControllerState.goal) {
+    petRuntime.sleepyAcc += dt;
+    if (petRuntime.sleepyAcc > 12) petControllerState = setPetRuntimeState(petControllerState, 'sleepy');
+  } else if (moving || petControllerState.state !== 'sleepy') petRuntime.sleepyAcc = 0;
+  resolveCircle(pet.group.position, CFG.petRadius);
+  if (petControllerState.goal === 'wait_car' && pet.group.position.distanceTo(falconGroup.position) < 4.8) {
+    petFaceToward(falconGroup.position, dt);
+  }
+  updatePetPresentation(dt, moving);
+}
+
+function updatePetPresentation(dt, moving) {
+  if (!pet?.inner || !petControllerState.visible) return;
+  petPresentation.phase += dt * (moving ? 8 : 2.2);
+  const bob = moving ? Math.abs(Math.sin(petPresentation.phase)) * 0.025 : Math.sin(petPresentation.phase) * 0.012;
+  pet.inner.position.y = bob;
+  pet.inner.rotation.x = petControllerState.state === 'sleepy' ? 0.28 : petControllerState.mood === 'worried' ? 0.08 : 0;
+  pet.inner.rotation.z = petControllerState.state === 'sleepy' ? 0.03 : petControllerState.mood === 'happy' ? Math.sin(petPresentation.phase) * 0.035 : petControllerState.mood === 'worried' ? 0.06 : 0;
 }
 
 function applyAction(action) {
@@ -3401,7 +3774,6 @@ function applyAction(action) {
     case 'picket': startStrike(); break;
     case 'throw_tomato': npcThrowTomato(); break;
     case 'invert': startInvert(); break;
-
     case 'goto': if (arg === 'car') setRoute(carSpot()); else if (arg && PLACES[arg]) setRoute(PLACES[arg]); break;
     default: break;
   }
@@ -3411,6 +3783,7 @@ function applyAction(action) {
 let bubbleUntil = 0;
 function showBubble(text, secs = 5) {
   bubbleTxt.textContent = text;
+  bubbleEl.querySelector('.who').textContent = npcDisplayName.toUpperCase();
   bubbleEl.style.display = 'block';
   bubbleUntil = performance.now() + secs * 1000;
 }
@@ -3464,6 +3837,9 @@ addEventListener('keydown', (e) => {
   initAudio(); // any gesture unlocks game audio
   keys[e.code] = true;
   if (e.code === 'KeyT' && !e.repeat) startListening();
+  if (e.code === 'KeyB' && !e.repeat) {
+    applyPetCommand(petControllerState.visible ? 'dismiss' : 'summon');
+  }
   // typed chat (E) — the fallback when the mic can't work (no internet, no
   // permission, Safari) and the only way to read the conversation log
   if (e.code === 'KeyE' && !e.repeat && !car.inCar) openChat();
@@ -3561,6 +3937,7 @@ function punch(power = 0) {
   const hitNum = npcState.punchCount;
   mood.happiness = Math.max(0, mood.happiness - 2);
   stats.punches++;
+  petReact('punch');
   memAdd('punches');
   hitJuice(power);
   ach('firstblood', 'First Blood — you punched an AI');
@@ -3671,6 +4048,10 @@ function updatePlayer(dt) {
       const interval = running ? 0.31 : 0.48;
       if (playerState.stepAcc >= interval) { playerState.stepAcc = 0; footstep(running); }
     }
+    if (petControllerState.visible && performance.now() >= petRuntime.nextMoveReaction) {
+      petRuntime.nextMoveReaction = performance.now() + 2200;
+      petReact('player_move');
+    }
   } else playerState.stepAcc = 0.3;
 
   playerState.vy += CFG.gravity * dt;
@@ -3778,7 +4159,9 @@ function updateNPC(dt) {
   }
 
   // happiness slowly drifts back toward neutral 6
+  const previousPetMood = mood.happiness;
   mood.happiness += (6 - mood.happiness) * dt * 0.012;
+  if (petControllerState.visible && Math.abs(previousPetMood - mood.happiness) > 1) petReact('npc_mood', mood.happiness);
 
   // P1-8: decay punch count (1 per 60s)
   npcState.punchDecayTimer += dt;
@@ -4197,7 +4580,9 @@ function updateEnvironment(now) {
 
 function updateOverlays() {
   if (performance.now() < bubbleUntil) {
-    const p = _v1.copy(npc.group.position); p.y += 2.0;
+    const petBubble = performance.now() < petBubbleUntil && pet?.group?.visible;
+    const bubbleTarget = petBubble ? pet.group : npc.group;
+    const p = _v1.copy(bubbleTarget.position); p.y += petBubble ? 1.25 : 2.0;
     p.project(camera);
     if (p.z < 1) {
       bubbleEl.style.display = 'block';
@@ -4324,11 +4709,36 @@ async function boot() {
   bootMsg.textContent = 'loading characters… (a custom FBX can take ~10s the first time)';
   const gltfLoader = new GLTFLoader();
   const fbxLoader = new FBXLoader();
-  const tryGlb = (url) => gltfLoader.loadAsync(url).catch(() => null);
+  const tryGlb = async (url) => {
+    try {
+      const head = await fetch(url, { method: 'HEAD' });
+      if (!head.ok || head.status === 204) return null;
+      return await gltfLoader.loadAsync(url);
+    } catch { return null; }
+  };
+  const tryPetGlb = async () => {
+    const url = './assets/chopper.glb';
+    let lastError = null;
+    // Load the actual binary instead of requiring a HEAD preflight. Some
+    // static hosts reject HEAD or return an unhelpful MIME type even though
+    // the GLB GET works correctly.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const gltf = await gltfLoader.loadAsync(url);
+        petAssetDiagnostics = inspectPetAsset(gltf);
+        return gltf;
+      } catch (error) {
+        lastError = error;
+        if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    petAssetDiagnostics = { ...petAssetFallback({ error: lastError }), available: false };
+    return null;
+  };
   const tryFbx = async (url) => {
     try {
       const head = await fetch(url, { method: 'HEAD' });
-      if (!head.ok) return null;
+      if (!head.ok || head.status === 204) return null;
       const obj = await fbxLoader.loadAsync(url);
       // Canonicalize Mixamo bone names: rigs vary ("mixamorig:Hips",
       // "mixamorig7Hips", "mixamorig1:Hips"…) — normalize all to
@@ -4347,13 +4757,14 @@ async function boot() {
   };
   // Drop a character at assets/npc.glb / assets/character.fbx / assets/player.glb
   // and it takes over automatically.
-  const [soldier, xbot, npcGlb, playerGlb, npcFbx, mocap] = await Promise.all([
+  const [soldier, xbot, npcGlb, playerGlb, npcFbx, mocap, chopperGlb] = await Promise.all([
     tryGlb('./assets/Soldier.glb'),
     tryGlb('./assets/Xbot.glb'),
     tryGlb('./assets/npc.glb'),
     tryGlb('./assets/player.glb'),
     tryFbx('./assets/character.fbx'),
     loadMocapLib(gltfLoader).catch(() => null),
+    tryPetGlb(),
   ]);
   // Custom Mixamo characters often ship without clips (yours has zero) —
   // borrow idle/walk/run/gestures from Xbot via the module-level bakeRetarget
@@ -4369,6 +4780,7 @@ async function boot() {
   // YOUR character (character.fbx) plays as the PLAYER; the Soldier is the NPC.
   const customPlayer = withDonorClips(playerGlb || npcFbx, xbot);
   const customNpc = withDonorClips(npcGlb, xbot);
+  const petGlb = withDonorClips(chopperGlb, xbot);
   [customPlayer, customNpc].forEach((model) => {
     if (!model?.scene) return;
     model.scene.traverse((o) => {
@@ -4403,6 +4815,19 @@ async function boot() {
   } else {
     player = capsuleFallback('#3f6b8a', 0);
   }
+
+  if (petGlb) {
+    pet = prepModel(petGlb, PET_ASSET_CONFIG.modelYaw, mocap, true, false);
+    pet.group.scale.setScalar(PET_ASSET_CONFIG.scale);
+  } else {
+    pet = capsuleFallback('#a86f8f', 0);
+    pet.group.scale.setScalar(PET_ASSET_CONFIG.scale);
+  }
+  pet.group.visible = false;
+  petRuntime.lastPos.copy(pet.group.position);
+  petAssetLog();
+  globalThis.__petDiagnostics = { ...petAssetDiagnostics, state: serializePetState(petControllerState) };
+  updatePetBar();
 
   buildNav();
 
@@ -4480,6 +4905,8 @@ async function boot() {
     gameMinutes += dt;
     updatePlayer(dt);
     updateCar(dt);
+    updatePetCar();
+    updatePet(dt);
     updateDebris(dt);
     updateSmoke(dt);
     updateTomatoes(dt);
@@ -4492,6 +4919,7 @@ async function boot() {
     tipTick(nowT);
     player.anim.update(dt);
     npc.anim.update(dt);
+    if (pet?.anim) pet.anim.update(dt);
     if (composer && settings.fancy) composer.render();
     else renderer.render(scene, camera);
     // selfie must be captured in the same frame the buffer was drawn

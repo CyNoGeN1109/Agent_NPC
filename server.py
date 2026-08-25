@@ -519,6 +519,20 @@ class Handler(SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
+    def do_HEAD(self):
+        # Optional character files are probed before GLTF/FBX loading. Return a
+        # quiet no-content result for absent files so browser fallback checks do
+        # not create noisy 404 console errors; direct GETs retain normal 404s.
+        optional = {"assets/npc.glb", "assets/player.glb", "assets/character.fbx", "assets/chopper.glb"}
+        path = self.path.split("?", 1)[0].lstrip("/")
+        full = os.path.join(WEB_ROOT, path)
+        if path in optional and not os.path.isfile(full):
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        super().do_HEAD()
+
     def do_POST(self):
         if self.path == "/say":
             try:

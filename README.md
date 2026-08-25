@@ -51,6 +51,7 @@ On macOS the NPC speaks via the built-in `say` command (Indian-accented **Rishi*
 | **hold click** | charge a punch — full charge is a slow-mo haymaker |
 | **Q** / **G** / **P** | throw a tomato 🍅 / feed a token 🪙 / pluck a flower 🌸 |
 | **F** / **R** | take the car 🚗 (click = horn) / repair it 🔧 |
+| **B** | summon/dismiss Chopper 🐾; chat commands include `follow`, `stay`, `come`, `wait by the car`, and `ride along` |
 | **J** / **C** / **Tab** / **O** | chores · challenges · therapy receipt · settings |
 | **V** / **Esc** | voice on-off · close chat |
 
@@ -87,6 +88,11 @@ docs/           ARCHITECTURE.md · DEPLOY.md · PLAN.md
 ## Deploy it free
 
 `web/` is static and `api/` mirrors the server as serverless functions — push to Vercel and it just works. See [docs/DEPLOY.md](docs/DEPLOY.md). Architecture and diagrams in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+The pet asset attribution, download blocker, runtime inspection fields, and
+One Piece public-release risk are documented in [docs/ASSETS.md](docs/ASSETS.md).
+Chopper is an isolated deterministic controller with fixed whitelisted lines;
+the NPC model does not emit or execute pet commands.
 
 ## License
 

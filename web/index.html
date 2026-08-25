@@ -157,6 +157,10 @@
 
   #moodbar .stage { margin-top: 5px; font-size: 11px; letter-spacing: .5px; color: #9fb0d8; }
 
+  #petbar { left: 14px; top: 102px; background: rgba(12,16,26,.78);
+            border: 1px solid rgba(255,255,255,.16); border-radius: 10px;
+            padding: 7px 11px; font-size: 12px; color: #d8e6ff; }
+
   /* cinematic edge-darkening — pure CSS, zero GPU cost */
   #vig { position: fixed; inset: 0; z-index: 5; pointer-events: none;
          background: radial-gradient(ellipse at center,
@@ -243,7 +247,7 @@
     &nbsp;·&nbsp; <b>hold click</b> punch &nbsp;·&nbsp; <b>Q</b> tomato 🍅
     &nbsp;·&nbsp; <b>G</b> feed 🪙 &nbsp;·&nbsp; <b>P</b> pluck 🌸 &nbsp;·&nbsp; <b>F</b> car 🚗 &nbsp;·&nbsp; <b>R</b> repair 🔧
     &nbsp;·&nbsp; <b>J</b> chores 📋 &nbsp;·&nbsp; <b>C</b> challenges 🎯
-    &nbsp;·&nbsp; <b>Tab</b> receipt 🧾 &nbsp;·&nbsp; <b>O</b> settings ⚙️
+    &nbsp;·&nbsp; <b>B</b> summon/dismiss pet 🐾 &nbsp;·&nbsp; <b>Tab</b> receipt 🧾 &nbsp;·&nbsp; <b>O</b> settings ⚙️
   </div>
   <div id="status" class="overlay">…</div>
   <div id="moodbar" class="overlay">
@@ -251,6 +255,7 @@
     <div class="bar"><div class="fill" id="moodfill"></div></div>
     <div class="stage" id="stage"></div>
   </div>
+  <div id="petbar" class="overlay">🐾 Chopper · dismissed · <b>B</b> summon</div>
   <div id="vig"></div>
   <div id="dmg"></div>
   <div id="board"></div>
