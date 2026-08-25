@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { coalesceOverflow, enqueueBounded, isSupportedAction, restoreHistory } from '../web/brain-utils.mjs';
-import { storageJson, storageSet } from '../web/storage-utils.mjs';
-import { renderLongReply } from '../web/text-render.mjs';
+import { normalizeMemory, storageJson, storageSet } from '../web/storage-utils.mjs';
+import { escapeHtml, renderLongReply } from '../web/text-render.mjs';
 import { modalShortcut } from '../web/ui-guards.mjs';
 
 class FakeNode {
@@ -60,6 +60,29 @@ test('long model replies render HTML payloads as text and preserve code blocks',
   const codeNode = rendered.children.find((child) => child.tagName === 'pre')?.children[0];
   assert.equal(codeNode.textContent.trim(), code);
   assert.match(serialize(rendered), /&lt;img src=x onerror=/);
+});
+
+test('persisted HTML payloads are escaped before insertion into trusted templates', () => {
+  const payload = `\"><img src=x onerror=\"window.__pwned=1\">`;
+  assert.equal(
+    escapeHtml(payload),
+    '&quot;&gt;&lt;img src=x onerror=&quot;window.__pwned=1&quot;&gt;',
+  );
+});
+
+test('memory normalization preserves the legacy diary upgrade flag', () => {
+  const normalized = normalizeMemory({
+    sessions: 4,
+    playerName: 'A&B',
+    diary: [{ session: 4, text: 'still remembered', fromModel: true }],
+  }, '2026-08-25');
+
+  assert.equal(normalized.playerName, 'AB');
+  assert.deepEqual(normalized.diary[0], {
+    session: 4,
+    text: 'still remembered',
+    fromModel: true,
+  });
 });
 
 test('malformed and blocked storage values fall back without throwing', () => {

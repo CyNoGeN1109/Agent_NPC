@@ -9,9 +9,11 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { NPC_NAME, ACTIONS, setNpcName, buildSystemPrompt } from './persona.js';
 import { pickPreferredVoice } from './voice-utils.js';
-import { storageGet, storageJson, storageSet } from './storage-utils.mjs';
+import {
+  normalizeMemory, sanitizeStoredName, storageGet, storageJson, storageSet,
+} from './storage-utils.mjs';
 import { coalesceOverflow, enqueueBounded, isSupportedAction, restoreHistory } from './brain-utils.mjs';
-import { renderLongReply } from './text-render.mjs';
+import { escapeHtml, renderLongReply } from './text-render.mjs';
 import { modalShortcut } from './ui-guards.mjs';
 
 // ---------------------------------------------------------------- config ---
@@ -1272,12 +1274,7 @@ const browserStorage = (() => {
 const MEM_KEY = 'tiny-gta-memory';
 const memory = (() => {
   const m = storageJson(browserStorage, MEM_KEY, null);
-  if (m && typeof m === 'object' && Array.isArray(m.diary)) return m;
-  return {
-    sessions: 0, punches: 0, heavyPunches: 0, tomatoHits: 0, runOvers: 0,
-    kos: 0, tokens: 0, obeyed: 0, insults: 0, flowers: 0,
-    playerName: '', firstSeen: new Date().toISOString().slice(0, 10), diary: [],
-  };
+  return normalizeMemory(m);
 })();
 memory.sessions++;
 memory.lastSeen = new Date().toISOString().slice(0, 10);
@@ -1466,10 +1463,10 @@ function reportCardExtras() {
   const bests = Object.entries(CHALLENGES)
     .map(([id, c]) => { const b = storageGet(browserStorage, bestKey(id), ''); return b ? `${c.name} ${b}s` : null; })
     .filter(Boolean).join(' · ');
-  return `<div class="row"><span>Session</span><b>#${memory.sessions} · ${lastStage}</b></div>` +
+  return `<div class="row"><span>Session</span><b>#${escapeHtml(memory.sessions)} · ${escapeHtml(lastStage)}</b></div>` +
     `<div class="row"><span>Chores done today</span><b>${chores.filter((c) => c.done).length}/${chores.length}</b></div>` +
     (quote ? `<div class="hint">his line of the day: “${escapeHtml(quote)}”</div>` : '') +
-    (bests ? `<div class="hint">🎯 bests: ${bests}</div>` : '');
+    (bests ? `<div class="hint">🎯 bests: ${escapeHtml(bests)}</div>` : '');
 }
 // M5: settings panel (O) — releases the pointer so the sliders are usable
 function toggleSettings() {
@@ -1481,18 +1478,18 @@ function toggleSettings() {
     (memory.playerName ? ` · knows you as "${memory.playerName}"` : '');
   el.innerHTML = '<h3>⚙️ SETTINGS &amp; STATUS</h3>' +
     '<div class="sect">Audio &amp; controls</div>' +
-    `<div class="row"><span>Master volume</span><input id="set-vol" type="range" min="0" max="1" step="0.05" value="${settings.volume}"></div>` +
-    `<div class="row"><span>Mouse speed</span><input id="set-sens" type="range" min="0.4" max="2" step="0.1" value="${settings.sens}"></div>` +
+    `<div class="row"><span>Master volume</span><input id="set-vol" type="range" min="0" max="1" step="0.05" value="${escapeHtml(settings.volume)}"></div>` +
+    `<div class="row"><span>Mouse speed</span><input id="set-sens" type="range" min="0.4" max="2" step="0.1" value="${escapeHtml(settings.sens)}"></div>` +
     `<div class="row"><span>His voice on</span><input id="set-voice" type="checkbox" ${voiceOn ? 'checked' : ''}></div>` +
     `<div class="row"><span>Hear his voice</span><button id="set-testvoice" class="dangerbtn" style="background:#3a6">TEST 🔊</button></div>` +
     `<div class="row"><span>Post-FX (bloom)${composer ? '' : ' <i style="color:#8b93a8">(n/a)</i>'}</span><input id="set-fancy" type="checkbox" ${settings.fancy && composer ? 'checked' : ''} ${composer ? '' : 'disabled'}></div>` +
     '<div class="sect">His memory of you</div>' +
-    `<div class="row"><span>Relationship</span><b style="font-size:11px">${relRow}</b></div>` +
-    `<div class="row"><span>Punches / tokens</span><b style="font-size:11px">${memory.punches} / ${memory.tokens}</b></div>` +
+    `<div class="row"><span>Relationship</span><b style="font-size:11px">${escapeHtml(relRow)}</b></div>` +
+    `<div class="row"><span>Punches / tokens</span><b style="font-size:11px">${escapeHtml(memory.punches)} / ${escapeHtml(memory.tokens)}</b></div>` +
     `<div class="row"><span>Achievements</span><b style="font-size:11px">${unlockedAch.size} unlocked</b></div>` +
     `<div class="row"><span>Wipe his memory</span><button id="set-reset" class="dangerbtn">RESET</button></div>` +
     '<div class="sect">Under the hood</div>' +
-    `<div class="row"><span>Brain</span><b style="font-size:11px">${modelLabel}</b></div>` +
+    `<div class="row"><span>Brain</span><b style="font-size:11px">${escapeHtml(modelLabel)}</b></div>` +
     '<div class="keys">🎮 <b>WASD</b> move · <b>Shift</b> run · <b>Space</b> jump · <b>hold&nbsp;T</b> talk · ' +
     '<b>E</b> type · hold <b>click</b> punch · <b>Q</b> tomato · <b>G</b> feed · <b>P</b> pluck · ' +
     '<b>F</b> car · <b>R</b> repair · <b>V</b> voice · <b>J</b> chores · <b>C</b> challenges · <b>Tab</b> receipt</div>' +
@@ -1592,7 +1589,13 @@ const CHORE_POOL = [
 function todayKey() { return new Date().toISOString().slice(0, 10); }
 function loadChores() {
   const saved = storageJson(browserStorage, `tiny-gta-chores-${todayKey()}`, null);
-  if (Array.isArray(saved) && saved.length) return saved;
+  if (Array.isArray(saved)) {
+    const normalized = saved.map((item) => {
+      const chore = CHORE_POOL.find((candidate) => candidate.action === item?.action);
+      return chore ? { action: chore.action, label: chore.label, done: item.done === true } : null;
+    }).filter(Boolean);
+    if (normalized.length) return normalized;
+  }
   const day = Math.floor(Date.now() / 86400000); // deterministic daily rotation
   const list = [];
   for (let i = 0; i < 5; i++) {
@@ -1643,7 +1646,7 @@ function renderBoard(force) {
   const el = document.getElementById('board');
   if (el.style.display !== 'block' && !force) return;
   el.innerHTML = '<h3>📋 CHORE BOARD</h3>' +
-    chores.map((c) => `<div class="row"><span>${c.done ? '✅' : '⬜'} ${c.label}</span></div>`).join('') +
+    chores.map((c) => `<div class="row"><span>${c.done ? '✅' : '⬜'} ${escapeHtml(c.label)}</span></div>`).join('') +
     '<div class="hint">say “get to work” and he does the lot · J to close</div>';
 }
 function toggleBoard() {
@@ -1694,7 +1697,7 @@ function toggleChallenges() {
   el.innerHTML = '<h3>🎯 CHALLENGES</h3>' +
     Object.entries(CHALLENGES).map(([id, c], i) => {
       const best = storageGet(browserStorage, bestKey(id), '');
-      return `<div class="row"><span><b>${i + 1}</b> · ${c.name}</span><b>${best ? `${best}s` : '—'}</b></div>` +
+      return `<div class="row"><span><b>${i + 1}</b> · ${c.name}</span><b>${best ? `${escapeHtml(best)}s` : '—'}</b></div>` +
         `<div class="hint">${c.desc}</div>`;
     }).join('') +
     '<div class="hint" style="margin-top:8px">press 1 / 2 / 3 to start · C to close</div>';
@@ -2428,9 +2431,14 @@ function startProc(type, secs) {
 const settings = (() => {
   const base = { volume: 1, sens: 1, fancy: true };
   const saved = storageJson(browserStorage, 'tiny-gta-settings', {});
-  return saved && typeof saved === 'object' && !Array.isArray(saved)
-    ? { ...base, ...saved }
-    : base;
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return base;
+  const clamp = (value, min, max, fallback) => Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value)) : fallback;
+  return {
+    volume: clamp(saved.volume, 0, 1, base.volume),
+    sens: clamp(saved.sens, 0.4, 2, base.sens),
+    fancy: saved.fancy === true,
+  };
 })();
 function saveSettings() {
   storageSet(browserStorage, 'tiny-gta-settings', JSON.stringify(settings));
@@ -2853,11 +2861,8 @@ let gameMinutes = 19 * 60 + 40;
 // non-command reply is taken as the answer (scripted — no LLM round-trip).
 let awaitingName = false;
 function captureName(raw) {
-  const name = raw
-    .replace(/^(i\s*am|i'?m|my\s+name\s+is|it'?s|call\s+me|mera\s+naam)\s+/i, '')
-    .replace(/[^\p{L}\p{M}\s'-]/gu, '')
-    .trim()
-    .slice(0, 24);
+  const name = sanitizeStoredName(raw
+    .replace(/^(i\s*am|i'?m|my\s+name\s+is|it'?s|call\s+me|mera\s+naam)\s+/i, ''));
   awaitingName = false;
   if (!name) return false;
   memory.playerName = name.charAt(0).toUpperCase() + name.slice(1);
@@ -3009,12 +3014,6 @@ function logLine(cls, text) {
   div.textContent = text;
   logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
-}
-
-function escapeHtml(text) {
-  return String(text).replace(/[&<>"']/g, (ch) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[ch]));
 }
 
 // Small models under decoding pressure sometimes loop a token before
@@ -4435,8 +4434,8 @@ async function boot() {
   }
 
   // M5: title screen — the world is ready behind the curtain, enter on click
-  bootMsg.innerHTML = `${modelLabel}<br>session #${memory.sessions} · relationship: ${lastStage}` +
-    (memory.playerName ? `<br>welcome back, ${memory.playerName}` : '');
+  bootMsg.innerHTML = `${escapeHtml(modelLabel)}<br>session #${escapeHtml(memory.sessions)} · relationship: ${escapeHtml(lastStage)}` +
+    (memory.playerName ? `<br>welcome back, ${escapeHtml(memory.playerName)}` : '');
   const startBtn = document.createElement('button');
   startBtn.id = 'startbtn';
   startBtn.textContent = memory.sessions > 1 ? '😏 BACK FOR MORE' : '😈 LET ME AT HIM';
