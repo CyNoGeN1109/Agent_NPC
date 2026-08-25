@@ -24,6 +24,11 @@ Click **START**, allow the mic, and he'll greet you — on first meeting he asks
 
 ### The brain (pick one)
 
+- **Cloud — Sarvam:** put a key in `.env` (`SARVAM_API_KEY=...`). The default
+  `sarvam-105b-conversations` model is tuned for real-time conversational use
+  and Indian-language/code-mixed replies. Sarvam is preferred automatically
+  when this key is present.
+
 - **Cloud — OpenRouter:** put a key in `.env` (`OPENROUTER_API_KEY=...`) and it uses free models out of the box. Free-tier models share a daily cap; add a few credits or drop in a paid model for heavy use.
 - **Local — Ollama / LM Studio:** leave the key blank and run a local model (`ollama pull qwen2.5:3b`). Free, unlimited, offline. Auto-detected.
 

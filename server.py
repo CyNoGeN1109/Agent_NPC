@@ -3,6 +3,7 @@
 
 Serves the game (./web) and proxies /chat to an LLM:
   - OpenRouter    (cloud, preferred in auto mode when OPENROUTER_API_KEY is set)
+  - Sarvam        (cloud, preferred when SARVAM_API_KEY is set)
   - Ollama        (local, http://localhost:11434)
   - LM Studio     (local, OpenAI-compatible, http://localhost:1234/v1)
 
@@ -12,12 +13,15 @@ var always wins over the file.
 
 Env vars:
   NPC_MODEL          model name (Ollama; default: largest model found)
-  NPC_BACKEND        "ollama" | "openai" | "openrouter" | "auto" (default: auto)
+  NPC_BACKEND        "sarvam" | "ollama" | "openai" | "openrouter" | "auto" (default: auto)
   OLLAMA_URL         default http://localhost:11434
   OPENAI_URL         default http://localhost:1234/v1
   OPENROUTER_API_KEY OpenRouter API key (enables the openrouter backend)
   OPENROUTER_MODEL   default tencent/hy3:free
   OPENROUTER_URL     default https://openrouter.ai/api/v1
+  SARVAM_API_KEY     Sarvam API subscription key (enables the sarvam backend)
+  SARVAM_MODEL       default sarvam-105b-conversations
+  SARVAM_URL         default https://api.sarvam.ai/v1
   ELEVENLABS_API_KEY optional — NPC speaks with an ElevenLabs voice when set
   NPC_VOICE_ID       ElevenLabs voice id (default N2lVS1w4EtoT3dr4eOWO — Callum,
                      a premade voice that works on the free tier via API)
@@ -75,6 +79,11 @@ OPENROUTER_FALLBACKS = [m.strip() for m in os.environ.get(
     "nvidia/nemotron-nano-9b-v2:free,"
     "openai/gpt-oss-20b:free,"
     "poolside/laguna-xs-2.1:free").split(",") if m.strip()]
+
+# --- Sarvam (optional cloud backend; preferred in auto mode when a key is set)
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
+SARVAM_URL = os.environ.get("SARVAM_URL", "https://api.sarvam.ai/v1")
+SARVAM_MODEL = os.environ.get("SARVAM_MODEL", "sarvam-105b-conversations")
 
 # --- ElevenLabs voice (optional): if ELEVENLABS_API_KEY is set, the NPC speaks
 # with this voice; otherwise the client falls back to the built-in macOS voice.
@@ -141,8 +150,11 @@ def detect_backend():
     forced = os.environ.get("NPC_BACKEND", "auto")
     model = os.environ.get("NPC_MODEL", "")
 
-    # OpenRouter needs no network probe (just an env var) and, per current
-    # setup, is the preferred backend "for now" — checked first in auto mode.
+    # Cloud backends need no network probe. Sarvam is preferred when configured,
+    # followed by OpenRouter, then local backends.
+    if forced in ("auto", "sarvam") and SARVAM_API_KEY:
+        return "sarvam", model or SARVAM_MODEL
+
     if forced in ("auto", "openrouter") and OPENROUTER_API_KEY:
         return "openrouter", model or OPENROUTER_MODEL
 
@@ -418,6 +430,50 @@ def chat_openrouter(model, messages):
     raise RuntimeError(last_err)
 
 
+def chat_sarvam(model, messages):
+    """Call Sarvam's OpenAI-compatible chat endpoint.
+
+    Sarvam supports the same structured-output formats used by OpenRouter,
+    while the API key uses its documented api-subscription-key header.
+    """
+    if not SARVAM_API_KEY:
+        raise RuntimeError("SARVAM_API_KEY not set")
+    headers = {"api-subscription-key": SARVAM_API_KEY}
+    base = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.8,
+        "max_tokens": 500,
+        "frequency_penalty": 0.5,
+    }
+    attempts = [
+        {**base, "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "npc_reply", "strict": True, "schema": NPC_REPLY_SCHEMA},
+        }},
+        {**base, "response_format": {"type": "json_object"}},
+        base,
+    ]
+    last_err = None
+    for payload in attempts:
+        try:
+            resp = http_json(f"{SARVAM_URL.rstrip('/')}/chat/completions", payload,
+                             headers=headers, timeout=30)
+            message = resp.get("choices", [{}])[0].get("message", {})
+            content = strip_think(message.get("content", ""))
+            if content:
+                return content
+            last_err = "empty reply"
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode()[:200]
+            last_err = f"sarvam HTTP {e.code}: {detail}"
+            if e.code in (401, 403):
+                raise RuntimeError(last_err)
+        except Exception as e:
+            last_err = f"sarvam error: {e}"
+    raise RuntimeError(last_err or "sarvam request failed")
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEB_ROOT, **kwargs)
@@ -456,8 +512,8 @@ class Handler(SimpleHTTPRequestHandler):
                                 "tts": bool(ELEVEN_KEY), "say": SAY_AVAILABLE})
             else:
                 self.send_json(
-                    {"ok": False, "error": "No local model server found. "
-                     "Start Ollama (`ollama serve`) or LM Studio's server."},
+                    {"ok": False, "error": "No model backend configured or reachable. "
+                     "Configure Sarvam/OpenRouter or start Ollama/LM Studio."},
                     code=503,
                 )
             return
@@ -523,11 +579,12 @@ class Handler(SimpleHTTPRequestHandler):
             backend, model = detect_backend()
             if not backend:
                 self.send_json(
-                    {"error": "No local model server reachable "
-                     "(tried Ollama and LM Studio)."}, code=503)
+                     {"error": "No model backend configured or reachable."}, code=503)
                 return
 
-            if backend == "ollama":
+            if backend == "sarvam":
+                reply = chat_sarvam(model, messages)
+            elif backend == "ollama":
                 try:
                     reply = chat_ollama(model, messages)
                 except RuntimeError:
@@ -574,8 +631,9 @@ def main():
     if backend:
         print(f"NPC brain: {model}  (via {backend})")
     else:
-        print("WARNING: no local model server found — the world will load, "
-              "but the NPC can't talk until Ollama or LM Studio is running.")
+        print("WARNING: no model backend found — the world will load, "
+              "but the NPC can't talk until Sarvam/OpenRouter is configured "
+              "or Ollama/LM Studio is running.")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
