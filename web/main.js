@@ -9,6 +9,10 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { NPC_NAME, ACTIONS, setNpcName, buildSystemPrompt } from './persona.js';
 import { pickPreferredVoice } from './voice-utils.js';
+import { storageGet, storageJson, storageSet } from './storage-utils.mjs';
+import { coalesceOverflow, enqueueBounded, isSupportedAction, restoreHistory } from './brain-utils.mjs';
+import { renderLongReply } from './text-render.mjs';
+import { modalShortcut } from './ui-guards.mjs';
 
 // ---------------------------------------------------------------- config ---
 const CFG = {
@@ -1209,6 +1213,17 @@ const keys = {};
 let camYaw = Math.PI, camPitch = 0.28;
 let pointerLocked = false;
 let chatOpen = false;
+const MODAL_OVERLAY_IDS = ['stats', 'board', 'challenges', 'settings'];
+
+function activeModalId() {
+  return MODAL_OVERLAY_IDS.find((id) => document.getElementById(id)?.style.display === 'block') || null;
+}
+
+function clearGameplayInput() {
+  for (const code of Object.keys(keys)) keys[code] = false;
+  chargeStart = 0;
+  chargeEl.style.display = 'none';
+}
 
 const playerState = { vy: 0, grounded: true, lastPunch: 0, stepAcc: 0 };
 const npcState = {
@@ -1251,12 +1266,13 @@ const mood = { happiness: 7, fedTokens: 0, lastFeed: 0 };
 // -------------------------------------- persistent memory across sessions (M2) ---
 // Nothing you do to him is ever forgotten. Lifetime counters + a diary feed
 // the system prompt, drive the boot greeting, and derive a relationship stage.
+const browserStorage = (() => {
+  try { return globalThis.localStorage; } catch { return null; }
+})();
 const MEM_KEY = 'tiny-gta-memory';
 const memory = (() => {
-  try {
-    const m = JSON.parse(localStorage.getItem(MEM_KEY));
-    if (m && typeof m === 'object' && Array.isArray(m.diary)) return m;
-  } catch { /* first meeting */ }
+  const m = storageJson(browserStorage, MEM_KEY, null);
+  if (m && typeof m === 'object' && Array.isArray(m.diary)) return m;
   return {
     sessions: 0, punches: 0, heavyPunches: 0, tomatoHits: 0, runOvers: 0,
     kos: 0, tokens: 0, obeyed: 0, insults: 0, flowers: 0,
@@ -1266,7 +1282,7 @@ const memory = (() => {
 memory.sessions++;
 memory.lastSeen = new Date().toISOString().slice(0, 10);
 function saveMemory() {
-  try { localStorage.setItem(MEM_KEY, JSON.stringify(memory)); } catch { /* full */ }
+  storageSet(browserStorage, MEM_KEY, JSON.stringify(memory));
 }
 saveMemory();
 
@@ -1276,9 +1292,9 @@ saveMemory();
 function resetMemory() {
   if (!confirm('Wipe his memory of you? Sessions, grudges, diary, achievements, chat history — all gone. He meets you as a stranger. (Your settings stay.)')) return;
   try {
-    for (let i = localStorage.length - 1; i >= 0; i--) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith('tiny-gta-') && k !== 'tiny-gta-settings') localStorage.removeItem(k);
+    for (let i = browserStorage.length - 1; i >= 0; i--) {
+      const k = browserStorage.key(i);
+      if (k && k.startsWith('tiny-gta-') && k !== 'tiny-gta-settings') browserStorage.removeItem(k);
     }
   } catch { /* noop */ }
   location.reload();
@@ -1396,7 +1412,8 @@ const stats = {
   obeyed: 0, insults: 0, kos: 0, carHits: 0, nearMisses: 0, messages: 0,
 };
 const INSULT_RE = /stupid|idiot|useless|dumb|trash|garbage|hate you|shut up|pathetic|loser|worthless|bakwas|nikamma/i;
-const unlockedAch = new Set(JSON.parse(localStorage.getItem('tiny-gta-ach') || '[]'));
+const savedAchievements = storageJson(browserStorage, 'tiny-gta-ach', []);
+const unlockedAch = new Set(Array.isArray(savedAchievements) ? savedAchievements : []);
 let toastTimer = 0;
 function toast(text) {
   const el = document.getElementById('toast');
@@ -1408,7 +1425,7 @@ function toast(text) {
 function ach(id, label) {
   if (unlockedAch.has(id)) return;
   unlockedAch.add(id);
-  localStorage.setItem('tiny-gta-ach', JSON.stringify([...unlockedAch]));
+  storageSet(browserStorage, 'tiny-gta-ach', JSON.stringify([...unlockedAch]));
   toast(`🏆 ${label}`);
   achSound();
 }
@@ -1420,6 +1437,8 @@ function frustrationScore() {
 function toggleStats() {
   const el = document.getElementById('stats');
   if (el.style.display === 'block') { el.style.display = 'none'; return; }
+  document.exitPointerLock?.();
+  clearGameplayInput();
   const rows = [
     ['Punches landed', stats.punches],
     ['Fully-charged haymakers', stats.heavyPunches],
@@ -1445,11 +1464,11 @@ function toggleStats() {
 function reportCardExtras() {
   const quote = sessionQuotes.length ? sessionQuotes[(Math.random() * sessionQuotes.length) | 0] : null;
   const bests = Object.entries(CHALLENGES)
-    .map(([id, c]) => { const b = localStorage.getItem(bestKey(id)); return b ? `${c.name} ${b}s` : null; })
+    .map(([id, c]) => { const b = storageGet(browserStorage, bestKey(id), ''); return b ? `${c.name} ${b}s` : null; })
     .filter(Boolean).join(' · ');
   return `<div class="row"><span>Session</span><b>#${memory.sessions} · ${lastStage}</b></div>` +
     `<div class="row"><span>Chores done today</span><b>${chores.filter((c) => c.done).length}/${chores.length}</b></div>` +
-    (quote ? `<div class="hint">his line of the day: “${quote}”</div>` : '') +
+    (quote ? `<div class="hint">his line of the day: “${escapeHtml(quote)}”</div>` : '') +
     (bests ? `<div class="hint">🎯 bests: ${bests}</div>` : '');
 }
 // M5: settings panel (O) — releases the pointer so the sliders are usable
@@ -1457,6 +1476,7 @@ function toggleSettings() {
   const el = document.getElementById('settings');
   if (el.style.display === 'block') { el.style.display = 'none'; return; }
   document.exitPointerLock?.();
+  clearGameplayInput();
   const relRow = `${lastStage} · session #${memory.sessions}` +
     (memory.playerName ? ` · knows you as "${memory.playerName}"` : '');
   el.innerHTML = '<h3>⚙️ SETTINGS &amp; STATUS</h3>' +
@@ -1571,10 +1591,8 @@ const CHORE_POOL = [
 ];
 function todayKey() { return new Date().toISOString().slice(0, 10); }
 function loadChores() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(`tiny-gta-chores-${todayKey()}`));
-    if (Array.isArray(saved) && saved.length) return saved;
-  } catch { /* fresh board */ }
+  const saved = storageJson(browserStorage, `tiny-gta-chores-${todayKey()}`, null);
+  if (Array.isArray(saved) && saved.length) return saved;
   const day = Math.floor(Date.now() / 86400000); // deterministic daily rotation
   const list = [];
   for (let i = 0; i < 5; i++) {
@@ -1585,7 +1603,7 @@ function loadChores() {
 }
 const chores = loadChores();
 function saveChores() {
-  try { localStorage.setItem(`tiny-gta-chores-${todayKey()}`, JSON.stringify(chores)); } catch { /* full */ }
+  storageSet(browserStorage, `tiny-gta-chores-${todayKey()}`, JSON.stringify(chores));
 }
 saveChores();
 const work = { active: false, nextAt: 0 };
@@ -1631,6 +1649,8 @@ function renderBoard(force) {
 function toggleBoard() {
   const el = document.getElementById('board');
   if (el.style.display === 'block') { el.style.display = 'none'; return; }
+  document.exitPointerLock?.();
+  clearGameplayInput();
   renderBoard(true);
   el.style.display = 'block';
 }
@@ -1653,9 +1673,10 @@ function startChallenge(id) {
 function challengeWin() {
   if (!challenge.id) return;
   const secs = (performance.now() - challenge.start) / 1000;
-  const prev = parseFloat(localStorage.getItem(bestKey(challenge.id)) || 'Infinity');
+  const saved = Number.parseFloat(storageGet(browserStorage, bestKey(challenge.id), ''));
+  const prev = Number.isFinite(saved) ? saved : Infinity;
   const isBest = secs < prev;
-  if (isBest) { try { localStorage.setItem(bestKey(challenge.id), secs.toFixed(1)); } catch { /* full */ } }
+  if (isBest) storageSet(browserStorage, bestKey(challenge.id), secs.toFixed(1));
   toast(`🏆 ${CHALLENGES[challenge.id].name} — ${secs.toFixed(1)}s${isBest ? ' · NEW BEST' : ` (best ${prev.toFixed(1)}s)`}`);
   achSound();
   challenge.id = null;
@@ -1668,9 +1689,11 @@ function challengeFail(reason) {
 function toggleChallenges() {
   const el = document.getElementById('challenges');
   if (el.style.display === 'block') { el.style.display = 'none'; return; }
+  document.exitPointerLock?.();
+  clearGameplayInput();
   el.innerHTML = '<h3>🎯 CHALLENGES</h3>' +
     Object.entries(CHALLENGES).map(([id, c], i) => {
-      const best = localStorage.getItem(bestKey(id));
+      const best = storageGet(browserStorage, bestKey(id), '');
       return `<div class="row"><span><b>${i + 1}</b> · ${c.name}</span><b>${best ? `${best}s` : '—'}</b></div>` +
         `<div class="hint">${c.desc}</div>`;
     }).join('') +
@@ -2115,6 +2138,7 @@ function hornSound() {
 }
 function updateCar(dt) {
   if (!car.inCar) return;
+  if (chatOpen || activeModalId()) { car.speed = 0; return; }
   const accel = (keys.KeyW ? 9 : 0) - (keys.KeyS ? 8 : 0);
   car.speed += accel * dt;
   car.speed -= car.speed * 1.6 * dt;
@@ -2366,11 +2390,32 @@ function triggerKO() {
   }, 12100);
 }
 
-// Preserve every player/event message while the local model is busy. The old
-// single slot silently replaced earlier events (or a voice message) under load.
+// Preserve a bounded event backlog while the local model is busy. The old
+// single slot silently replaced earlier events (or a voice message) under load;
+// overflow is now explicitly coalesced and surfaced to the model/player.
 const pendingMessages = [];
+const MAX_PENDING_MESSAGES = 8;
+let pendingOverflowCount = 0;
 function queueBrainMessage(text) {
-  if (pendingMessages.length < 8) pendingMessages.push(text);
+  if (enqueueBounded(pendingMessages, text, MAX_PENDING_MESSAGES)) return true;
+  // Keep the queue bounded, but make the loss explicit to both the player and
+  // the model. Repeated background events share one stable summary entry while
+  // retaining the latest dropped event for useful context.
+  pendingOverflowCount++;
+  const last = pendingMessages.length - 1;
+  if (last >= 0) coalesceOverflow(pendingMessages, last, pendingOverflowCount, text);
+  if (pendingOverflowCount === 1) {
+    logLine('sys', '(NPC event queue full — additional background events coalesced)');
+  }
+  return false;
+}
+
+function drainPendingMessage() {
+  if (brainBusy || !pendingMessages.length) {
+    if (!pendingMessages.length) pendingOverflowCount = 0;
+    return;
+  }
+  sendToBrain(pendingMessages.shift());
 }
 
 function startProc(type, secs) {
@@ -2382,11 +2427,13 @@ function startProc(type, secs) {
 // M5: player settings (O key) — persisted across sessions
 const settings = (() => {
   const base = { volume: 1, sens: 1, fancy: true };
-  try { return { ...base, ...JSON.parse(localStorage.getItem('tiny-gta-settings') || '{}') }; }
-  catch { return base; }
+  const saved = storageJson(browserStorage, 'tiny-gta-settings', {});
+  return saved && typeof saved === 'object' && !Array.isArray(saved)
+    ? { ...base, ...saved }
+    : base;
 })();
 function saveSettings() {
-  try { localStorage.setItem('tiny-gta-settings', JSON.stringify(settings)); } catch { /* full */ }
+  storageSet(browserStorage, 'tiny-gta-settings', JSON.stringify(settings));
 }
 let audioCtx = null, stepBuf = null, masterGain = null;
 function initAudio() {
@@ -2857,21 +2904,16 @@ function bootGreeting() {
 
 function initHistory(systemPrompt) {
   // Try restoring from localStorage
-  const saved = localStorage.getItem(`tiny-gta-history-${npcDisplayName}`);
-  if (saved) {
-    try {
-      const parsed = JSON.parse(saved);
-      if (Array.isArray(parsed) && parsed.length > 1) {
-        // Replace system prompt with current one (in case it changed)
-        parsed[0] = { role: 'system', content: systemPrompt };
-        // Repair pre-fix sessions where a malformed model reply was stored
-        // verbatim and then taught the model to echo `say` / `action` keys.
-        history = parsed.map((m) => m?.role === 'assistant'
-          ? { ...m, content: JSON.stringify(parseReply(m.content)) }
-          : m);
-        return;
-      }
-    } catch { /* fresh start */ }
+  const parsed = storageJson(browserStorage, `tiny-gta-history-${npcDisplayName}`, null);
+  if (Array.isArray(parsed) && parsed.length > 1) {
+    // Replace system prompt with current one (in case it changed)
+    parsed[0] = { role: 'system', content: systemPrompt };
+    // Repair pre-fix sessions where a malformed model reply was stored
+    // verbatim and then taught the model to echo `say` / `action` keys.
+    history = parsed.map((m) => m?.role === 'assistant'
+      ? { ...m, content: JSON.stringify(parseReply(m.content)) }
+      : m);
+    return;
   }
   history = [{ role: 'system', content: systemPrompt }];
 }
@@ -2881,8 +2923,8 @@ function saveHistory() {
     // Cap at 20 (system + last 19). Fewer messages = smaller prompt = faster
     // replies; long-term continuity lives in the [memory] block, not history.
     if (history.length > 20) history.splice(1, history.length - 20);
-    localStorage.setItem(`tiny-gta-history-${npcDisplayName}`, JSON.stringify(history));
-  } catch { /* storage full — no big deal */ }
+    storageSet(browserStorage, `tiny-gta-history-${npcDisplayName}`, JSON.stringify(history));
+  } catch { /* serialization failure — no big deal */ }
 }
 
 // P0-2: deterministic fallback command mapper (EN + HI + Hinglish).
@@ -2967,6 +3009,12 @@ function logLine(cls, text) {
   div.textContent = text;
   logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
 }
 
 // Small models under decoding pressure sometimes loop a token before
@@ -3062,6 +3110,8 @@ async function sendToBrain(text, _lastUserText) {
   statusEl.textContent = `${displayName} is thinking…`;
   chatSend.disabled = true;
   const userText = _lastUserText || text;
+  const historyBeforeTurn = history.slice();
+  let turnSucceeded = false;
   history.push({ role: 'user', content: `${observation()}\n${text}` });
   if (history.length > 20) history.splice(1, history.length - 20);
   try {
@@ -3073,6 +3123,10 @@ async function sendToBrain(text, _lastUserText) {
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     let { say, action, mood: replyMood } = parseReply(data.reply);
+    if (!isSupportedAction(action, ACTIONS)) {
+      logLine('sys', `(ignored unsupported NPC action: ${action || 'empty'})`);
+      action = 'none';
+    }
     // Never feed a malformed raw reply back to the model; one broken turn used
     // to teach the next turn to print its JSON keys in the visible dialogue.
     history.push({ role: 'assistant', content: JSON.stringify({ say, action, mood: replyMood }) });
@@ -3117,13 +3171,7 @@ async function sendToBrain(text, _lastUserText) {
 
     // P1-7: long-answer UX — code/long replies go fully into log, bubble skipped
     if (say.length > 250) {
-      const div = document.createElement('div');
-      div.className = 'n';
-      // Render code blocks with monospace
-      const rendered = say.replace(/```(\w*)\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
-                          .replace(/`([^`]+)`/g, '<code>$1</code>')
-                          .replace(/\n/g, '<br>');
-      div.innerHTML = `<strong>${displayName}:</strong> ${rendered}`;
+      const div = renderLongReply(say, displayName);
       logEl.appendChild(div);
       logEl.scrollTop = logEl.scrollHeight;
     } else {
@@ -3140,17 +3188,22 @@ async function sendToBrain(text, _lastUserText) {
     applyAction(action);
     if (action && action !== 'none' && !text.startsWith('[')) { stats.obeyed++; memAdd('obeyed'); }
     saveHistory();
+    turnSucceeded = true;
     statusEl.textContent = replyMood ? `${modelLabel} · ${displayName} feels ${replyMood}` : modelLabel;
   } catch (e) {
+    if (!turnSucceeded) restoreHistory(history, historyBeforeTurn);
     logLine('sys', `(brain error: ${e.message})`);
     statusEl.textContent = modelLabel;
   } finally {
     brainBusy = false;
     chatSend.disabled = false;
     if (chatOpen) chatInput.focus();
-    // Drain one queued event/message at a time so history stays in order.
+    // Yield between queued events so a direct user chat turn can claim the
+    // next slot instead of waiting behind the whole bounded backlog.
     if (pendingMessages.length) {
-      sendToBrain(pendingMessages.shift());
+      setTimeout(drainPendingMessage, 0);
+    } else {
+      pendingOverflowCount = 0;
     }
   }
 }
@@ -3401,6 +3454,21 @@ addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeChat();
     return;
   }
+  const modal = activeModalId();
+  if (modal) {
+    const shortcut = modalShortcut(modal, e.code, e.repeat);
+    if (shortcut === 'close-stats') { e.preventDefault(); toggleStats(); return; }
+    if (shortcut === 'close-board') { toggleBoard(); return; }
+    if (shortcut === 'close-challenges') { toggleChallenges(); return; }
+    if (shortcut === 'close-settings') { toggleSettings(); return; }
+    if (shortcut?.startsWith('challenge:')) {
+      startChallenge(['rage', 'citizen', 'marathon'][+shortcut.slice(-1) - 1]);
+      return;
+    }
+    const targetTag = e.target?.tagName;
+    if (!['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(targetTag)) e.preventDefault();
+    return;
+  }
   initAudio(); // any gesture unlocks game audio
   keys[e.code] = true;
   if (e.code === 'KeyT' && !e.repeat) startListening();
@@ -3587,7 +3655,7 @@ function updatePlayer(dt) {
   const fwd = _v1.set(Math.sin(camYaw), 0, Math.cos(camYaw));
   const right = _v2.set(-fwd.z, 0, fwd.x);
   let mx = 0, mz = 0;
-  if (!chatOpen) {
+  if (!chatOpen && !activeModalId()) {
     if (keys.KeyW) mz += 1;
     if (keys.KeyS) mz -= 1;
     if (keys.KeyD) mx += 1;

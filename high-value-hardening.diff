@@ -1,0 +1,762 @@
+diff --git a/.env.example b/.env.example
+index fa46720..87a1bc5 100644
+--- a/.env.example
++++ b/.env.example
+@@ -7,6 +7,10 @@ SARVAM_API_KEY=
+ SARVAM_MODEL=sarvam-105b-conversations
+ SARVAM_URL=https://api.sarvam.ai/v1
+ # NPC_BACKEND=sarvam        # force Sarvam when multiple keys are present
++# Optional Vercel burst/provider shields (defaults: 8 / 40 / 80 per minute).
++# NPC_MAX_REQUESTS_PER_IP=8
++# NPC_MAX_REQUESTS_PER_INSTANCE=40
++# NPC_MAX_PROVIDER_CALLS_PER_INSTANCE=80
+ 
+ # Alternative cloud provider: an OpenRouter key enables free models out of the box.
+ OPENROUTER_API_KEY=
+diff --git a/api/chat.js b/api/chat.js
+index c1e8eef..7937fb6 100644
+--- a/api/chat.js
++++ b/api/chat.js
+@@ -4,9 +4,10 @@
+ //
+ // Abuse protection (this is a public, key-spending endpoint):
+ //   - same-origin gate: other websites can't farm your OpenRouter key
+-//   - per-IP rate limit: 8 req/min (in-memory; resets on cold start — fine,
+-//     it's burst protection, not billing)
+-//   - global per-instance limit: 40 req/min protects the free-tier key
++//   - per-IP rate limit: 8 req/min (in-memory; resets on cold start — burst
++//     protection only, not a global quota)
++//   - global per-instance limit: 40 req/min protects the provider key
++//   - provider-attempt limit: bounds fallback/format retries per instance
+ //   - strict input caps: message count, per-message and total length
+ 
+ const SARVAM_KEY = process.env.SARVAM_API_KEY || '';
+@@ -17,6 +18,13 @@ const BACKEND = process.env.NPC_BACKEND || (SARVAM_KEY ? 'sarvam' : 'openrouter'
+ const MODEL = BACKEND === 'sarvam'
+   ? (process.env.NPC_MODEL || SARVAM_MODEL)
+   : (process.env.NPC_MODEL || process.env.OPENROUTER_MODEL || 'tencent/hy3:free');
++function positiveLimit(name, fallback) {
++  const value = Number.parseInt(process.env[name] || '', 10);
++  return Number.isFinite(value) && value > 0 ? value : fallback;
++}
++const MAX_IP_HITS = positiveLimit('NPC_MAX_REQUESTS_PER_IP', 8);
++const MAX_GLOBAL_HITS = positiveLimit('NPC_MAX_REQUESTS_PER_INSTANCE', 40);
++const MAX_PROVIDER_HITS = positiveLimit('NPC_MAX_PROVIDER_CALLS_PER_INSTANCE', 80);
+ // rotate small/fast free models so a 429 on one falls straight through to the
+ // next. (All :free models share one daily cap; when it's exhausted the whole
+ // chain 429s — only credits/paid/local-Ollama help then.) No giants.
+@@ -62,14 +70,23 @@ function normalize(raw) {
+ 
+ const ipHits = new Map();   // ip -> {count, reset}
+ let globalHits = { count: 0, reset: 0 };
++let providerHits = { count: 0, reset: 0 };
+ function limited(ip) {
+   const now = Date.now();
+   if (now > globalHits.reset) globalHits = { count: 0, reset: now + 60000 };
+-  if (++globalHits.count > 40) return 'busy — too many players right now, try again in a minute';
++  if (++globalHits.count > MAX_GLOBAL_HITS) return 'busy — too many players right now, try again in a minute';
+   if (ipHits.size > 5000) ipHits.clear();
+   const e = ipHits.get(ip);
+   if (!e || now > e.reset) { ipHits.set(ip, { count: 1, reset: now + 60000 }); return null; }
+-  if (++e.count > 8) return 'slow down — she needs a breather (rate limit, ~1 min)';
++  if (++e.count > MAX_IP_HITS) return 'slow down — she needs a breather (rate limit, ~1 min)';
++  return null;
++}
++function providerLimited() {
++  const now = Date.now();
++  if (now > providerHits.reset) providerHits = { count: 0, reset: now + 60000 };
++  if (++providerHits.count > MAX_PROVIDER_HITS) {
++    return 'provider budget shield reached on this function instance; try again in a minute';
++  }
+   return null;
+ }
+ 
+@@ -115,6 +132,8 @@ module.exports = async (req, res) => {
+     ];
+     if (ci === chain.length - 1) attempts.push(base); // last resort: unconstrained
+     for (const payload of attempts) {
++      const providerLimitMsg = providerLimited();
++      if (providerLimitMsg) return res.status(429).json({ error: providerLimitMsg });
+       try {
+         const endpoint = BACKEND === 'sarvam'
+           ? `${SARVAM_URL}/chat/completions`
+diff --git a/docs/DEPLOY.md b/docs/DEPLOY.md
+index ee7fce5..32f27b8 100644
+--- a/docs/DEPLOY.md
++++ b/docs/DEPLOY.md
+@@ -30,8 +30,9 @@ TTS — visitors get the browser voice by default (which is how the game ships).
+ 
+ - **Secrets**: `.env` is in `.vercelignore` — never uploaded. The key lives
+   only in Vercel env vars, server-side.
+-- **Rate limiting**: per-IP 8 chat/min + a global 40/min shield for the
+-  configured cloud key. Friendly 429 messages surface in-game.
++- **Rate limiting**: per-IP 8 chat/min + a global-per-instance 40/min shield for the
++  configured cloud key, plus an 80 provider-attempt/minute shield to bound
++  JSON-format and fallback retries. Friendly 429 messages surface in-game.
+ - **Same-origin gate**: other sites can't embed your endpoint and farm the key.
+ - **Input caps**: message count/length capped server-side, malformed history
+   rejected — a modified client can't inflate token spend.
+@@ -45,8 +46,13 @@ TTS — visitors get the browser voice by default (which is how the game ships).
+ 
+ ## The real limit to know about
+ 
+-Cloud model limits and pricing depend on the provider and account plan. Check
+-your Sarvam or OpenRouter dashboard before sharing a public deployment.
++These shields are intentionally in-memory because this project has no shared
++quota store. They reset on cold starts and are separate per Vercel function
++instance, so they are burst protection, not a globally enforceable billing
++quota. Before sharing a public deployment, configure the provider's own usage
++limit/budget controls in the Sarvam or OpenRouter dashboard. A truly global
++application quota would require adding shared infrastructure such as a hosted
++Redis/KV store.
+ 
+ ## Alternative
+ 
+diff --git a/web/main.js b/web/main.js
+index b7923f6..c696821 100644
+--- a/web/main.js
++++ b/web/main.js
+@@ -9,6 +9,10 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
+ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+ import { NPC_NAME, ACTIONS, setNpcName, buildSystemPrompt } from './persona.js';
+ import { pickPreferredVoice } from './voice-utils.js';
++import { storageGet, storageJson, storageSet } from './storage-utils.mjs';
++import { coalesceOverflow, enqueueBounded, isSupportedAction, restoreHistory } from './brain-utils.mjs';
++import { renderLongReply } from './text-render.mjs';
++import { modalShortcut } from './ui-guards.mjs';
+ 
+ // ---------------------------------------------------------------- config ---
+ const CFG = {
+@@ -1209,6 +1213,17 @@ const keys = {};
+ let camYaw = Math.PI, camPitch = 0.28;
+ let pointerLocked = false;
+ let chatOpen = false;
++const MODAL_OVERLAY_IDS = ['stats', 'board', 'challenges', 'settings'];
++
++function activeModalId() {
++  return MODAL_OVERLAY_IDS.find((id) => document.getElementById(id)?.style.display === 'block') || null;
++}
++
++function clearGameplayInput() {
++  for (const code of Object.keys(keys)) keys[code] = false;
++  chargeStart = 0;
++  chargeEl.style.display = 'none';
++}
+ 
+ const playerState = { vy: 0, grounded: true, lastPunch: 0, stepAcc: 0 };
+ const npcState = {
+@@ -1251,12 +1266,13 @@ const mood = { happiness: 7, fedTokens: 0, lastFeed: 0 };
+ // -------------------------------------- persistent memory across sessions (M2) ---
+ // Nothing you do to him is ever forgotten. Lifetime counters + a diary feed
+ // the system prompt, drive the boot greeting, and derive a relationship stage.
++const browserStorage = (() => {
++  try { return globalThis.localStorage; } catch { return null; }
++})();
+ const MEM_KEY = 'tiny-gta-memory';
+ const memory = (() => {
+-  try {
+-    const m = JSON.parse(localStorage.getItem(MEM_KEY));
+-    if (m && typeof m === 'object' && Array.isArray(m.diary)) return m;
+-  } catch { /* first meeting */ }
++  const m = storageJson(browserStorage, MEM_KEY, null);
++  if (m && typeof m === 'object' && Array.isArray(m.diary)) return m;
+   return {
+     sessions: 0, punches: 0, heavyPunches: 0, tomatoHits: 0, runOvers: 0,
+     kos: 0, tokens: 0, obeyed: 0, insults: 0, flowers: 0,
+@@ -1266,7 +1282,7 @@ const memory = (() => {
+ memory.sessions++;
+ memory.lastSeen = new Date().toISOString().slice(0, 10);
+ function saveMemory() {
+-  try { localStorage.setItem(MEM_KEY, JSON.stringify(memory)); } catch { /* full */ }
++  storageSet(browserStorage, MEM_KEY, JSON.stringify(memory));
+ }
+ saveMemory();
+ 
+@@ -1276,9 +1292,9 @@ saveMemory();
+ function resetMemory() {
+   if (!confirm('Wipe his memory of you? Sessions, grudges, diary, achievements, chat history — all gone. He meets you as a stranger. (Your settings stay.)')) return;
+   try {
+-    for (let i = localStorage.length - 1; i >= 0; i--) {
+-      const k = localStorage.key(i);
+-      if (k && k.startsWith('tiny-gta-') && k !== 'tiny-gta-settings') localStorage.removeItem(k);
++    for (let i = browserStorage.length - 1; i >= 0; i--) {
++      const k = browserStorage.key(i);
++      if (k && k.startsWith('tiny-gta-') && k !== 'tiny-gta-settings') browserStorage.removeItem(k);
+     }
+   } catch { /* noop */ }
+   location.reload();
+@@ -1396,7 +1412,8 @@ const stats = {
+   obeyed: 0, insults: 0, kos: 0, carHits: 0, nearMisses: 0, messages: 0,
+ };
+ const INSULT_RE = /stupid|idiot|useless|dumb|trash|garbage|hate you|shut up|pathetic|loser|worthless|bakwas|nikamma/i;
+-const unlockedAch = new Set(JSON.parse(localStorage.getItem('tiny-gta-ach') || '[]'));
++const savedAchievements = storageJson(browserStorage, 'tiny-gta-ach', []);
++const unlockedAch = new Set(Array.isArray(savedAchievements) ? savedAchievements : []);
+ let toastTimer = 0;
+ function toast(text) {
+   const el = document.getElementById('toast');
+@@ -1408,7 +1425,7 @@ function toast(text) {
+ function ach(id, label) {
+   if (unlockedAch.has(id)) return;
+   unlockedAch.add(id);
+-  localStorage.setItem('tiny-gta-ach', JSON.stringify([...unlockedAch]));
++  storageSet(browserStorage, 'tiny-gta-ach', JSON.stringify([...unlockedAch]));
+   toast(`🏆 ${label}`);
+   achSound();
+ }
+@@ -1420,6 +1437,8 @@ function frustrationScore() {
+ function toggleStats() {
+   const el = document.getElementById('stats');
+   if (el.style.display === 'block') { el.style.display = 'none'; return; }
++  document.exitPointerLock?.();
++  clearGameplayInput();
+   const rows = [
+     ['Punches landed', stats.punches],
+     ['Fully-charged haymakers', stats.heavyPunches],
+@@ -1445,11 +1464,11 @@ function toggleStats() {
+ function reportCardExtras() {
+   const quote = sessionQuotes.length ? sessionQuotes[(Math.random() * sessionQuotes.length) | 0] : null;
+   const bests = Object.entries(CHALLENGES)
+-    .map(([id, c]) => { const b = localStorage.getItem(bestKey(id)); return b ? `${c.name} ${b}s` : null; })
++    .map(([id, c]) => { const b = storageGet(browserStorage, bestKey(id), ''); return b ? `${c.name} ${b}s` : null; })
+     .filter(Boolean).join(' · ');
+   return `<div class="row"><span>Session</span><b>#${memory.sessions} · ${lastStage}</b></div>` +
+     `<div class="row"><span>Chores done today</span><b>${chores.filter((c) => c.done).length}/${chores.length}</b></div>` +
+-    (quote ? `<div class="hint">his line of the day: “${quote}”</div>` : '') +
++    (quote ? `<div class="hint">his line of the day: “${escapeHtml(quote)}”</div>` : '') +
+     (bests ? `<div class="hint">🎯 bests: ${bests}</div>` : '');
+ }
+ // M5: settings panel (O) — releases the pointer so the sliders are usable
+@@ -1457,6 +1476,7 @@ function toggleSettings() {
+   const el = document.getElementById('settings');
+   if (el.style.display === 'block') { el.style.display = 'none'; return; }
+   document.exitPointerLock?.();
++  clearGameplayInput();
+   const relRow = `${lastStage} · session #${memory.sessions}` +
+     (memory.playerName ? ` · knows you as "${memory.playerName}"` : '');
+   el.innerHTML = '<h3>⚙️ SETTINGS &amp; STATUS</h3>' +
+@@ -1571,10 +1591,8 @@ const CHORE_POOL = [
+ ];
+ function todayKey() { return new Date().toISOString().slice(0, 10); }
+ function loadChores() {
+-  try {
+-    const saved = JSON.parse(localStorage.getItem(`tiny-gta-chores-${todayKey()}`));
+-    if (Array.isArray(saved) && saved.length) return saved;
+-  } catch { /* fresh board */ }
++  const saved = storageJson(browserStorage, `tiny-gta-chores-${todayKey()}`, null);
++  if (Array.isArray(saved) && saved.length) return saved;
+   const day = Math.floor(Date.now() / 86400000); // deterministic daily rotation
+   const list = [];
+   for (let i = 0; i < 5; i++) {
+@@ -1585,7 +1603,7 @@ function loadChores() {
+ }
+ const chores = loadChores();
+ function saveChores() {
+-  try { localStorage.setItem(`tiny-gta-chores-${todayKey()}`, JSON.stringify(chores)); } catch { /* full */ }
++  storageSet(browserStorage, `tiny-gta-chores-${todayKey()}`, JSON.stringify(chores));
+ }
+ saveChores();
+ const work = { active: false, nextAt: 0 };
+@@ -1631,6 +1649,8 @@ function renderBoard(force) {
+ function toggleBoard() {
+   const el = document.getElementById('board');
+   if (el.style.display === 'block') { el.style.display = 'none'; return; }
++  document.exitPointerLock?.();
++  clearGameplayInput();
+   renderBoard(true);
+   el.style.display = 'block';
+ }
+@@ -1653,9 +1673,10 @@ function startChallenge(id) {
+ function challengeWin() {
+   if (!challenge.id) return;
+   const secs = (performance.now() - challenge.start) / 1000;
+-  const prev = parseFloat(localStorage.getItem(bestKey(challenge.id)) || 'Infinity');
++  const saved = Number.parseFloat(storageGet(browserStorage, bestKey(challenge.id), ''));
++  const prev = Number.isFinite(saved) ? saved : Infinity;
+   const isBest = secs < prev;
+-  if (isBest) { try { localStorage.setItem(bestKey(challenge.id), secs.toFixed(1)); } catch { /* full */ } }
++  if (isBest) storageSet(browserStorage, bestKey(challenge.id), secs.toFixed(1));
+   toast(`🏆 ${CHALLENGES[challenge.id].name} — ${secs.toFixed(1)}s${isBest ? ' · NEW BEST' : ` (best ${prev.toFixed(1)}s)`}`);
+   achSound();
+   challenge.id = null;
+@@ -1668,9 +1689,11 @@ function challengeFail(reason) {
+ function toggleChallenges() {
+   const el = document.getElementById('challenges');
+   if (el.style.display === 'block') { el.style.display = 'none'; return; }
++  document.exitPointerLock?.();
++  clearGameplayInput();
+   el.innerHTML = '<h3>🎯 CHALLENGES</h3>' +
+     Object.entries(CHALLENGES).map(([id, c], i) => {
+-      const best = localStorage.getItem(bestKey(id));
++      const best = storageGet(browserStorage, bestKey(id), '');
+       return `<div class="row"><span><b>${i + 1}</b> · ${c.name}</span><b>${best ? `${best}s` : '—'}</b></div>` +
+         `<div class="hint">${c.desc}</div>`;
+     }).join('') +
+@@ -2115,6 +2138,7 @@ function hornSound() {
+ }
+ function updateCar(dt) {
+   if (!car.inCar) return;
++  if (chatOpen || activeModalId()) { car.speed = 0; return; }
+   const accel = (keys.KeyW ? 9 : 0) - (keys.KeyS ? 8 : 0);
+   car.speed += accel * dt;
+   car.speed -= car.speed * 1.6 * dt;
+@@ -2366,11 +2390,32 @@ function triggerKO() {
+   }, 12100);
+ }
+ 
+-// Preserve every player/event message while the local model is busy. The old
+-// single slot silently replaced earlier events (or a voice message) under load.
++// Preserve a bounded event backlog while the local model is busy. The old
++// single slot silently replaced earlier events (or a voice message) under load;
++// overflow is now explicitly coalesced and surfaced to the model/player.
+ const pendingMessages = [];
++const MAX_PENDING_MESSAGES = 8;
++let pendingOverflowCount = 0;
+ function queueBrainMessage(text) {
+-  if (pendingMessages.length < 8) pendingMessages.push(text);
++  if (enqueueBounded(pendingMessages, text, MAX_PENDING_MESSAGES)) return true;
++  // Keep the queue bounded, but make the loss explicit to both the player and
++  // the model. Repeated background events share one stable summary entry while
++  // retaining the latest dropped event for useful context.
++  pendingOverflowCount++;
++  const last = pendingMessages.length - 1;
++  if (last >= 0) coalesceOverflow(pendingMessages, last, pendingOverflowCount, text);
++  if (pendingOverflowCount === 1) {
++    logLine('sys', '(NPC event queue full — additional background events coalesced)');
++  }
++  return false;
++}
++
++function drainPendingMessage() {
++  if (brainBusy || !pendingMessages.length) {
++    if (!pendingMessages.length) pendingOverflowCount = 0;
++    return;
++  }
++  sendToBrain(pendingMessages.shift());
+ }
+ 
+ function startProc(type, secs) {
+@@ -2382,11 +2427,13 @@ function startProc(type, secs) {
+ // M5: player settings (O key) — persisted across sessions
+ const settings = (() => {
+   const base = { volume: 1, sens: 1, fancy: true };
+-  try { return { ...base, ...JSON.parse(localStorage.getItem('tiny-gta-settings') || '{}') }; }
+-  catch { return base; }
++  const saved = storageJson(browserStorage, 'tiny-gta-settings', {});
++  return saved && typeof saved === 'object' && !Array.isArray(saved)
++    ? { ...base, ...saved }
++    : base;
+ })();
+ function saveSettings() {
+-  try { localStorage.setItem('tiny-gta-settings', JSON.stringify(settings)); } catch { /* full */ }
++  storageSet(browserStorage, 'tiny-gta-settings', JSON.stringify(settings));
+ }
+ let audioCtx = null, stepBuf = null, masterGain = null;
+ function initAudio() {
+@@ -2857,21 +2904,16 @@ function bootGreeting() {
+ 
+ function initHistory(systemPrompt) {
+   // Try restoring from localStorage
+-  const saved = localStorage.getItem(`tiny-gta-history-${npcDisplayName}`);
+-  if (saved) {
+-    try {
+-      const parsed = JSON.parse(saved);
+-      if (Array.isArray(parsed) && parsed.length > 1) {
+-        // Replace system prompt with current one (in case it changed)
+-        parsed[0] = { role: 'system', content: systemPrompt };
+-        // Repair pre-fix sessions where a malformed model reply was stored
+-        // verbatim and then taught the model to echo `say` / `action` keys.
+-        history = parsed.map((m) => m?.role === 'assistant'
+-          ? { ...m, content: JSON.stringify(parseReply(m.content)) }
+-          : m);
+-        return;
+-      }
+-    } catch { /* fresh start */ }
++  const parsed = storageJson(browserStorage, `tiny-gta-history-${npcDisplayName}`, null);
++  if (Array.isArray(parsed) && parsed.length > 1) {
++    // Replace system prompt with current one (in case it changed)
++    parsed[0] = { role: 'system', content: systemPrompt };
++    // Repair pre-fix sessions where a malformed model reply was stored
++    // verbatim and then taught the model to echo `say` / `action` keys.
++    history = parsed.map((m) => m?.role === 'assistant'
++      ? { ...m, content: JSON.stringify(parseReply(m.content)) }
++      : m);
++    return;
+   }
+   history = [{ role: 'system', content: systemPrompt }];
+ }
+@@ -2881,8 +2923,8 @@ function saveHistory() {
+     // Cap at 20 (system + last 19). Fewer messages = smaller prompt = faster
+     // replies; long-term continuity lives in the [memory] block, not history.
+     if (history.length > 20) history.splice(1, history.length - 20);
+-    localStorage.setItem(`tiny-gta-history-${npcDisplayName}`, JSON.stringify(history));
+-  } catch { /* storage full — no big deal */ }
++    storageSet(browserStorage, `tiny-gta-history-${npcDisplayName}`, JSON.stringify(history));
++  } catch { /* serialization failure — no big deal */ }
+ }
+ 
+ // P0-2: deterministic fallback command mapper (EN + HI + Hinglish).
+@@ -2969,6 +3011,12 @@ function logLine(cls, text) {
+   logEl.scrollTop = logEl.scrollHeight;
+ }
+ 
++function escapeHtml(text) {
++  return String(text).replace(/[&<>"']/g, (ch) => ({
++    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
++  }[ch]));
++}
++
+ // Small models under decoding pressure sometimes loop a token before
+ // breaking into real content ("say say say say Narendra Modi") — collapse
+ // any run of 3+ identical consecutive words (nobody says a word 4x on purpose).
+@@ -3062,6 +3110,8 @@ async function sendToBrain(text, _lastUserText) {
+   statusEl.textContent = `${displayName} is thinking…`;
+   chatSend.disabled = true;
+   const userText = _lastUserText || text;
++  const historyBeforeTurn = history.slice();
++  let turnSucceeded = false;
+   history.push({ role: 'user', content: `${observation()}\n${text}` });
+   if (history.length > 20) history.splice(1, history.length - 20);
+   try {
+@@ -3073,6 +3123,10 @@ async function sendToBrain(text, _lastUserText) {
+     const data = await res.json();
+     if (data.error) throw new Error(data.error);
+     let { say, action, mood: replyMood } = parseReply(data.reply);
++    if (!isSupportedAction(action, ACTIONS)) {
++      logLine('sys', `(ignored unsupported NPC action: ${action || 'empty'})`);
++      action = 'none';
++    }
+     // Never feed a malformed raw reply back to the model; one broken turn used
+     // to teach the next turn to print its JSON keys in the visible dialogue.
+     history.push({ role: 'assistant', content: JSON.stringify({ say, action, mood: replyMood }) });
+@@ -3117,13 +3171,7 @@ async function sendToBrain(text, _lastUserText) {
+ 
+     // P1-7: long-answer UX — code/long replies go fully into log, bubble skipped
+     if (say.length > 250) {
+-      const div = document.createElement('div');
+-      div.className = 'n';
+-      // Render code blocks with monospace
+-      const rendered = say.replace(/```(\w*)\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+-                          .replace(/`([^`]+)`/g, '<code>$1</code>')
+-                          .replace(/\n/g, '<br>');
+-      div.innerHTML = `<strong>${displayName}:</strong> ${rendered}`;
++      const div = renderLongReply(say, displayName);
+       logEl.appendChild(div);
+       logEl.scrollTop = logEl.scrollHeight;
+     } else {
+@@ -3140,17 +3188,22 @@ async function sendToBrain(text, _lastUserText) {
+     applyAction(action);
+     if (action && action !== 'none' && !text.startsWith('[')) { stats.obeyed++; memAdd('obeyed'); }
+     saveHistory();
++    turnSucceeded = true;
+     statusEl.textContent = replyMood ? `${modelLabel} · ${displayName} feels ${replyMood}` : modelLabel;
+   } catch (e) {
++    if (!turnSucceeded) restoreHistory(history, historyBeforeTurn);
+     logLine('sys', `(brain error: ${e.message})`);
+     statusEl.textContent = modelLabel;
+   } finally {
+     brainBusy = false;
+     chatSend.disabled = false;
+     if (chatOpen) chatInput.focus();
+-    // Drain one queued event/message at a time so history stays in order.
++    // Yield between queued events so a direct user chat turn can claim the
++    // next slot instead of waiting behind the whole bounded backlog.
+     if (pendingMessages.length) {
+-      sendToBrain(pendingMessages.shift());
++      setTimeout(drainPendingMessage, 0);
++    } else {
++      pendingOverflowCount = 0;
+     }
+   }
+ }
+@@ -3401,6 +3454,21 @@ addEventListener('keydown', (e) => {
+     if (e.key === 'Escape') closeChat();
+     return;
+   }
++  const modal = activeModalId();
++  if (modal) {
++    const shortcut = modalShortcut(modal, e.code, e.repeat);
++    if (shortcut === 'close-stats') { e.preventDefault(); toggleStats(); return; }
++    if (shortcut === 'close-board') { toggleBoard(); return; }
++    if (shortcut === 'close-challenges') { toggleChallenges(); return; }
++    if (shortcut === 'close-settings') { toggleSettings(); return; }
++    if (shortcut?.startsWith('challenge:')) {
++      startChallenge(['rage', 'citizen', 'marathon'][+shortcut.slice(-1) - 1]);
++      return;
++    }
++    const targetTag = e.target?.tagName;
++    if (!['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(targetTag)) e.preventDefault();
++    return;
++  }
+   initAudio(); // any gesture unlocks game audio
+   keys[e.code] = true;
+   if (e.code === 'KeyT' && !e.repeat) startListening();
+@@ -3587,7 +3655,7 @@ function updatePlayer(dt) {
+   const fwd = _v1.set(Math.sin(camYaw), 0, Math.cos(camYaw));
+   const right = _v2.set(-fwd.z, 0, fwd.x);
+   let mx = 0, mz = 0;
+-  if (!chatOpen) {
++  if (!chatOpen && !activeModalId()) {
+     if (keys.KeyW) mz += 1;
+     if (keys.KeyS) mz -= 1;
+     if (keys.KeyD) mx += 1;
+diff --git a/tests/hardening.test.mjs b/tests/hardening.test.mjs
+new file mode 100644
+index 0000000..32f8993
+--- /dev/null
++++ b/tests/hardening.test.mjs
+@@ -0,0 +1,123 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { coalesceOverflow, enqueueBounded, isSupportedAction, restoreHistory } from '../web/brain-utils.mjs';
++import { storageJson, storageSet } from '../web/storage-utils.mjs';
++import { renderLongReply } from '../web/text-render.mjs';
++import { modalShortcut } from '../web/ui-guards.mjs';
++
++class FakeNode {
++  constructor(tagName) {
++    this.tagName = tagName;
++    this.children = [];
++    this._text = null;
++    this.className = '';
++  }
++
++  appendChild(child) {
++    this.children.push(child);
++    return child;
++  }
++
++  set textContent(value) {
++    this.children = [];
++    this._text = String(value);
++  }
++
++  get textContent() {
++    return this._text ?? this.children.map((child) => child.textContent).join('');
++  }
++}
++
++const fakeDocument = {
++  createElement: (tagName) => new FakeNode(tagName),
++  createTextNode: (text) => new FakeNode('#text').withText(text),
++};
++
++FakeNode.prototype.withText = function withText(text) {
++  this._text = String(text);
++  return this;
++};
++
++function serialize(node) {
++  if (node.tagName === '#text') return node._text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
++  const attrs = node.className ? ` class="${node.className}"` : '';
++  return `<${node.tagName}${attrs}>${node.children.map(serialize).join('')}</${node.tagName}>`;
++}
++
++function tags(node) {
++  return [node.tagName, ...node.children.flatMap(tags)];
++}
++
++test('long model replies render HTML payloads as text and preserve code blocks', () => {
++  const payload = '<img src=x onerror="window.__pwned=1">';
++  const code = 'const safe = "<b>still text</b>";';
++  const fence = '```';
++  const reply = `${payload}\n\n${'ordinary words '.repeat(20)}\n${fence}js\n${code}\n${fence}`;
++  const rendered = renderLongReply(reply, 'Agent', fakeDocument);
++
++  assert.deepEqual(tags(rendered).filter((tag) => tag === 'img' || tag === 'script'), []);
++  assert.equal(rendered.children.some((child) => child.tagName === 'pre'), true);
++  const codeNode = rendered.children.find((child) => child.tagName === 'pre')?.children[0];
++  assert.equal(codeNode.textContent.trim(), code);
++  assert.match(serialize(rendered), /&lt;img src=x onerror=/);
++});
++
++test('malformed and blocked storage values fall back without throwing', () => {
++  const malformed = { getItem: () => '{not-json' };
++  assert.deepEqual(storageJson(malformed, 'tiny-gta-ach', []), []);
++  assert.equal(storageSet(null, 'tiny-gta-ach', '[]'), false);
++
++  const blocked = {
++    getItem: () => { throw new Error('SecurityError'); },
++    setItem: () => { throw new Error('SecurityError'); },
++  };
++  assert.deepEqual(storageJson(blocked, 'tiny-gta-ach', []), []);
++  assert.equal(storageSet(blocked, 'tiny-gta-ach', '[]'), false);
++});
++
++test('failed chat turns are removed while prior successful turns survive', () => {
++  const previousUser = { role: 'user', content: 'previous' };
++  const previousAssistant = { role: 'assistant', content: 'answered' };
++  const history = [{ role: 'system', content: 'system' }, previousUser, previousAssistant];
++  const beforeFailure = history.slice();
++  history.push({ role: 'user', content: 'will fail' });
++  history.push({ role: 'assistant', content: 'never committed' });
++
++  restoreHistory(history, beforeFailure);
++  assert.deepEqual(history, [{ role: 'system', content: 'system' }, previousUser, previousAssistant]);
++  history.push({ role: 'user', content: 'retry' });
++  assert.equal(history.at(-1).content, 'retry');
++});
++
++test('unsupported model actions are rejected while supported parameterized actions survive', () => {
++  const actions = ['none', 'jump', 'goto:car'];
++  assert.equal(isSupportedAction('fly', actions), false);
++  assert.equal(isSupportedAction('jump:8', actions), true);
++  assert.equal(isSupportedAction('GOTO:CAR', actions), true);
++});
++
++test('event backlog stays bounded and rejects the ninth independent event', () => {
++  const queue = [];
++  for (let i = 0; i < 8; i++) assert.equal(enqueueBounded(queue, `[event] ${i}`, 8), true);
++  assert.equal(enqueueBounded(queue, '[event] 8', 8), false);
++  assert.equal(queue.length, 8);
++});
++
++test('event overflow retains the latest dropped event without growing the queue', () => {
++  const queue = ['[event] first queued event'];
++  coalesceOverflow(queue, 0, 1, '[event] dropped one');
++  coalesceOverflow(queue, 0, 2, '[event] dropped latest');
++  assert.equal(queue.length, 1);
++  assert.match(queue[0], /2 total/);
++  assert.match(queue[0], /dropped latest/);
++  assert.doesNotMatch(queue[0], /dropped one/);
++});
++
++test('modal overlays consume gameplay shortcuts but retain their close/start keys', () => {
++  assert.equal(modalShortcut('stats', 'KeyW'), null);
++  assert.equal(modalShortcut('stats', 'Tab'), 'close-stats');
++  assert.equal(modalShortcut('board', 'KeyJ'), 'close-board');
++  assert.equal(modalShortcut('challenges', 'Digit3'), 'challenge:3');
++  assert.equal(modalShortcut('settings', 'KeyO'), 'close-settings');
++  assert.equal(modalShortcut('settings', 'KeyW', true), null);
++});
+diff --git a/web/brain-utils.mjs b/web/brain-utils.mjs
+new file mode 100644
+index 0000000..8c3b1ed
+--- /dev/null
++++ b/web/brain-utils.mjs
+@@ -0,0 +1,26 @@
++export function isSupportedAction(action, actions) {
++  const normalized = String(action || '').toLowerCase().trim();
++  if (actions.includes(normalized)) return true;
++  return /^jump:[1-8]$/.test(normalized);
++}
++
++export function restoreHistory(history, snapshot) {
++  history.splice(0, history.length, ...snapshot);
++}
++
++export function enqueueBounded(queue, text, max = 8) {
++  if (queue.length >= max) return false;
++  queue.push(text);
++  return true;
++}
++
++export function coalesceOverflow(queue, index, count, text) {
++  const prefix = '[event] Additional background events were coalesced while you were thinking.';
++  const latest = String(text).slice(0, 600);
++  const marker = `${prefix} (${count} total). Latest dropped event: ${latest}`;
++  const current = queue[index] || '';
++  const markerIndex = current.indexOf(`\n${prefix}`);
++  queue[index] = markerIndex === -1
++    ? `${current}\n${marker}`
++    : `${current.slice(0, markerIndex)}\n${marker}`;
++}
+diff --git a/web/storage-utils.mjs b/web/storage-utils.mjs
+new file mode 100644
+index 0000000..7b57162
+--- /dev/null
++++ b/web/storage-utils.mjs
+@@ -0,0 +1,30 @@
++// Small defensive boundary for browser storage. Keeping this separate makes
++// the failure behavior easy to exercise without booting the 3D scene.
++export function storageGet(storage, key, fallback = null) {
++  try {
++    const value = storage?.getItem(key);
++    return value == null ? fallback : value;
++  } catch {
++    return fallback;
++  }
++}
++
++export function storageSet(storage, key, value) {
++  if (!storage) return false;
++  try {
++    storage.setItem(key, value);
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++export function storageJson(storage, key, fallback) {
++  const raw = storageGet(storage, key, null);
++  if (raw == null || raw === '') return fallback;
++  try {
++    return JSON.parse(raw);
++  } catch {
++    return fallback;
++  }
++}
+diff --git a/web/text-render.mjs b/web/text-render.mjs
+new file mode 100644
+index 0000000..39fea76
+--- /dev/null
++++ b/web/text-render.mjs
+@@ -0,0 +1,40 @@
++// Render model text without treating any part of it as markup.
++function appendTextWithBreaks(parent, text, doc) {
++  const lines = String(text).split('\n');
++  lines.forEach((line, index) => {
++    if (index) parent.appendChild(doc.createElement('br'));
++    parent.appendChild(doc.createTextNode(line));
++  });
++}
++
++export function renderLongReply(text, displayName, doc = globalThis.document) {
++  const div = doc.createElement('div');
++  div.className = 'n';
++
++  const strong = doc.createElement('strong');
++  strong.textContent = `${displayName}:`;
++  div.appendChild(strong);
++  div.appendChild(doc.createTextNode(' '));
++
++  const source = String(text);
++  const tokenRe = /```(\w*)\n?([\s\S]*?)```|`([^`]+)`/g;
++  let cursor = 0;
++  let match;
++  while ((match = tokenRe.exec(source))) {
++    appendTextWithBreaks(div, source.slice(cursor, match.index), doc);
++    if (match[2] !== undefined) {
++      const pre = doc.createElement('pre');
++      const code = doc.createElement('code');
++      code.textContent = match[2];
++      pre.appendChild(code);
++      div.appendChild(pre);
++    } else {
++      const code = doc.createElement('code');
++      code.textContent = match[3];
++      div.appendChild(code);
++    }
++    cursor = tokenRe.lastIndex;
++  }
++  appendTextWithBreaks(div, source.slice(cursor), doc);
++  return div;
++}
+diff --git a/web/ui-guards.mjs b/web/ui-guards.mjs
+new file mode 100644
+index 0000000..a2e4bf0
+--- /dev/null
++++ b/web/ui-guards.mjs
+@@ -0,0 +1,11 @@
++export function modalShortcut(modal, code, repeat = false) {
++  if (repeat) return null;
++  if (modal === 'stats' && code === 'Tab') return 'close-stats';
++  if (modal === 'board' && code === 'KeyJ') return 'close-board';
++  if (modal === 'challenges' && code === 'KeyC') return 'close-challenges';
++  if (modal === 'settings' && code === 'KeyO') return 'close-settings';
++  if (modal === 'challenges' && /^Digit[123]$/.test(code)) {
++    return `challenge:${+code.slice(-1)}`;
++  }
++  return null;
++}

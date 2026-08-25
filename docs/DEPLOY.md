@@ -30,8 +30,9 @@ TTS — visitors get the browser voice by default (which is how the game ships).
 
 - **Secrets**: `.env` is in `.vercelignore` — never uploaded. The key lives
   only in Vercel env vars, server-side.
-- **Rate limiting**: per-IP 8 chat/min + a global 40/min shield for the
-  configured cloud key. Friendly 429 messages surface in-game.
+- **Rate limiting**: per-IP 8 chat/min + a global-per-instance 40/min shield for the
+  configured cloud key, plus an 80 provider-attempt/minute shield to bound
+  JSON-format and fallback retries. Friendly 429 messages surface in-game.
 - **Same-origin gate**: other sites can't embed your endpoint and farm the key.
 - **Input caps**: message count/length capped server-side, malformed history
   rejected — a modified client can't inflate token spend.
@@ -45,8 +46,13 @@ TTS — visitors get the browser voice by default (which is how the game ships).
 
 ## The real limit to know about
 
-Cloud model limits and pricing depend on the provider and account plan. Check
-your Sarvam or OpenRouter dashboard before sharing a public deployment.
+These shields are intentionally in-memory because this project has no shared
+quota store. They reset on cold starts and are separate per Vercel function
+instance, so they are burst protection, not a globally enforceable billing
+quota. Before sharing a public deployment, configure the provider's own usage
+limit/budget controls in the Sarvam or OpenRouter dashboard. A truly global
+application quota would require adding shared infrastructure such as a hosted
+Redis/KV store.
 
 ## Alternative
 
