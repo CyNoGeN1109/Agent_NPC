@@ -4,9 +4,10 @@
 //
 // Abuse protection (this is a public, key-spending endpoint):
 //   - same-origin gate: other websites can't farm your OpenRouter key
-//   - per-IP rate limit: 8 req/min (in-memory; resets on cold start — fine,
-//     it's burst protection, not billing)
-//   - global per-instance limit: 40 req/min protects the free-tier key
+//   - per-IP rate limit: 8 req/min (in-memory; resets on cold start — burst
+//     protection only, not a global quota)
+//   - global per-instance limit: 40 req/min protects the provider key
+//   - provider-attempt limit: bounds fallback/format retries per instance
 //   - strict input caps: message count, per-message and total length
 
 const SARVAM_KEY = process.env.SARVAM_API_KEY || '';
@@ -17,6 +18,13 @@ const BACKEND = process.env.NPC_BACKEND || (SARVAM_KEY ? 'sarvam' : 'openrouter'
 const MODEL = BACKEND === 'sarvam'
   ? (process.env.NPC_MODEL || SARVAM_MODEL)
   : (process.env.NPC_MODEL || process.env.OPENROUTER_MODEL || 'tencent/hy3:free');
+function positiveLimit(name, fallback) {
+  const value = Number.parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+const MAX_IP_HITS = positiveLimit('NPC_MAX_REQUESTS_PER_IP', 8);
+const MAX_GLOBAL_HITS = positiveLimit('NPC_MAX_REQUESTS_PER_INSTANCE', 40);
+const MAX_PROVIDER_HITS = positiveLimit('NPC_MAX_PROVIDER_CALLS_PER_INSTANCE', 80);
 // rotate small/fast free models so a 429 on one falls straight through to the
 // next. (All :free models share one daily cap; when it's exhausted the whole
 // chain 429s — only credits/paid/local-Ollama help then.) No giants.
@@ -62,14 +70,23 @@ function normalize(raw) {
 
 const ipHits = new Map();   // ip -> {count, reset}
 let globalHits = { count: 0, reset: 0 };
+let providerHits = { count: 0, reset: 0 };
 function limited(ip) {
   const now = Date.now();
   if (now > globalHits.reset) globalHits = { count: 0, reset: now + 60000 };
-  if (++globalHits.count > 40) return 'busy — too many players right now, try again in a minute';
+  if (++globalHits.count > MAX_GLOBAL_HITS) return 'busy — too many players right now, try again in a minute';
   if (ipHits.size > 5000) ipHits.clear();
   const e = ipHits.get(ip);
   if (!e || now > e.reset) { ipHits.set(ip, { count: 1, reset: now + 60000 }); return null; }
-  if (++e.count > 8) return 'slow down — she needs a breather (rate limit, ~1 min)';
+  if (++e.count > MAX_IP_HITS) return 'slow down — she needs a breather (rate limit, ~1 min)';
+  return null;
+}
+function providerLimited() {
+  const now = Date.now();
+  if (now > providerHits.reset) providerHits = { count: 0, reset: now + 60000 };
+  if (++providerHits.count > MAX_PROVIDER_HITS) {
+    return 'provider budget shield reached on this function instance; try again in a minute';
+  }
   return null;
 }
 
@@ -115,6 +132,8 @@ module.exports = async (req, res) => {
     ];
     if (ci === chain.length - 1) attempts.push(base); // last resort: unconstrained
     for (const payload of attempts) {
+      const providerLimitMsg = providerLimited();
+      if (providerLimitMsg) return res.status(429).json({ error: providerLimitMsg });
       try {
         const endpoint = BACKEND === 'sarvam'
           ? `${SARVAM_URL}/chat/completions`
