@@ -10,7 +10,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { NPC_NAME, ACTIONS, setNpcName, buildSystemPrompt } from './persona.js';
 import { pickPreferredVoice } from './voice-utils.js';
 import {
-  normalizeMemory, sanitizeStoredName, storageGet, storageJson, storageSet,
+  normalizeMemory, normalizeSettings, sanitizeStoredName, storageGet, storageJson, storageSet,
 } from './storage-utils.mjs';
 import { coalesceOverflow, enqueueBounded, isSupportedAction, restoreHistory } from './brain-utils.mjs';
 import { escapeHtml, renderLongReply } from './text-render.mjs';
@@ -1506,6 +1506,8 @@ function toggleSettings() {
   });
   document.getElementById('set-voice').addEventListener('change', (e) => {
     voiceOn = e.target.checked;
+    settings.voice = voiceOn;
+    saveSettings();
     if (!voiceOn) stopSpeaking();
   });
   document.getElementById('set-testvoice').addEventListener('click', testVoice);
@@ -2429,16 +2431,7 @@ function startProc(type, secs) {
 // ----------------------------------------------------------------- audio ---
 // M5: player settings (O key) — persisted across sessions
 const settings = (() => {
-  const base = { volume: 1, sens: 1, fancy: true };
-  const saved = storageJson(browserStorage, 'tiny-gta-settings', {});
-  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return base;
-  const clamp = (value, min, max, fallback) => Number.isFinite(value)
-    ? Math.min(max, Math.max(min, value)) : fallback;
-  return {
-    volume: clamp(saved.volume, 0, 1, base.volume),
-    sens: clamp(saved.sens, 0.4, 2, base.sens),
-    fancy: saved.fancy === true,
-  };
+  return normalizeSettings(storageJson(browserStorage, 'tiny-gta-settings', {}));
 })();
 function saveSettings() {
   storageSet(browserStorage, 'tiny-gta-settings', JSON.stringify(settings));
@@ -2641,7 +2634,7 @@ function playerHurtFlash() {
 }
 
 // ------------------------------------------------------------ NPC voice ---
-let voiceOn = true, chosenVoiceEn = null, chosenVoiceHi = null, indianVoiceFound = false;
+let voiceOn = settings.voice, chosenVoiceEn = null, chosenVoiceHi = null, indianVoiceFound = false;
 const DEVANAGARI_RE = /[ऀ-ॿ]/; // any Hindi character in the reply
 
 function debugVoice(msg) {
