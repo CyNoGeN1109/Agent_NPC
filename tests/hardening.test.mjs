@@ -6,6 +6,10 @@ import { normalizeMemory, normalizeSettings, storageJson, storageSet } from '../
 import { escapeHtml, renderLongReply } from '../web/text-render.mjs';
 import { modalShortcut } from '../web/ui-guards.mjs';
 import {
+  CHOPPER_ACTIONS, buildChopperSystemPrompt, chopperFallbackReply,
+  isSupportedChopperAction,
+} from '../web/chopper-persona.mjs';
+import {
   isSupportedPetCommand, normalizePetState, petAssetFallback, petReaction, petRecovery,
   serializePetState, transitionPet,
 } from '../web/pet-controller.mjs';
@@ -266,4 +270,14 @@ test('Chopper summon introduction uses the bundled audio asset', () => {
   assert.ok(fs.statSync(audioPath).size > 0);
   assert.match(mainSource, /new Audio\('\.\/assets\/chopper\.mp3'\)/);
   assert.match(mainSource, /if \(command === 'summon'\) \{[\s\S]*playChopperIntroduction\(\)/);
+});
+
+test('powered Chopper keeps a separate action protocol and safe fallback', () => {
+  assert.equal(isSupportedChopperAction('bounce'), true);
+  assert.equal(isSupportedChopperAction('drive'), false);
+  assert.match(buildChopperSystemPrompt('test-model', 'state: follow'), /separate character from Agent/);
+  assert.deepEqual(chopperFallbackReply('Chopper follow me', { command: 'follow' }), {
+    say: 'I am right behind you!', action: 'follow', mood: 'happy',
+  });
+  assert.equal(CHOPPER_ACTIONS.includes('enter_car'), true);
 });

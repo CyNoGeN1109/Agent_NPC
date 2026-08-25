@@ -51,7 +51,7 @@ On macOS the NPC speaks via the built-in `say` command (Indian-accented **Rishi*
 | **hold click** | charge a punch — full charge is a slow-mo haymaker |
 | **Q** / **G** / **P** | throw a tomato 🍅 / feed a token 🪙 / pluck a flower 🌸 |
 | **F** / **R** | take the car 🚗 (click = horn) / repair it 🔧 |
-| **B** | summon/dismiss Chopper 🐾; chat commands include `follow`, `stay`, `come`, `wait by the car`, and `ride along` |
+| **B** | summon/dismiss Chopper 🐾; address him in chat for powered dialogue and commands like `follow`, `stay`, `come`, `wait by the car`, and `ride along` |
 | **J** / **C** / **Tab** / **O** | chores · challenges · therapy receipt · settings |
 | **V** / **Esc** | voice on-off · close chat |
 
@@ -64,7 +64,12 @@ On macOS the NPC speaks via the built-in `say` command (Indian-accented **Rishi*
 - **He fights back.** Jump-scares, mimicking your walk, throwing tomatoes back, and a "revenge patch" that inverts your commands for a minute. Beat him to rock bottom and he goes quiet — *psycho mode*.
 - **Stuff to actually do.** A daily chore board, timed challenges, a screenshot-ready therapy receipt, a drivable car (yes, you can run him over — he will never forgive you).
 
-His whole mind is plain English in [`web/persona.js`](web/persona.js). The model replies with one JSON object — `{"say", "action", "mood"}` — and the body executes the action. A deterministic command mapper (English + Hindi/Hinglish) backstops the model so clear orders always land.
+Agent's mind is in [`web/persona.js`](web/persona.js), while Chopper has a separate
+powered persona in [`web/chopper-persona.mjs`](web/chopper-persona.mjs). Each model
+turn returns one JSON object — `{"say", "action", "mood"}` — and the matching
+controller validates the action before execution. Addressing Chopper explicitly
+routes the turn to his own short-lived conversation context and dedicated browser
+voice; ordinary chat remains Agent's.
 
 ---
 
@@ -75,6 +80,8 @@ web/            browser game
   index.html      UI shell + import map
   main.js         world, physics, animation retarget, controllers, systems, HUD
   persona.js      the NPC's mind — system prompt, actions, behaviour rules
+  chopper-persona.mjs
+                  separate powered Chopper prompt, actions, and safe fallbacks
   voice-utils.js  voice selection helper
   vendor/         Three.js r160 (vendored — works offline)
   assets/         characters + mocap library
@@ -91,8 +98,9 @@ docs/           ARCHITECTURE.md · DEPLOY.md · PLAN.md
 
 The pet asset attribution, download blocker, runtime inspection fields, and
 One Piece public-release risk are documented in [docs/ASSETS.md](docs/ASSETS.md).
-Chopper is an isolated deterministic controller with fixed whitelisted lines;
-the NPC model does not emit or execute pet commands.
+Chopper remains an isolated deterministic movement/physics controller. His model
+may suggest only the small Chopper action whitelist; it never mutates the world
+directly or executes Agent actions.
 
 ## License
 

@@ -96,7 +96,9 @@ same server + persona plug straight in.
 | File | Owns |
 |---|---|
 | `web/main.js` | Entire game: world build, colliders, nav graph, animation retargeting, player/NPC controllers, car physics, voice I/O, economy, retaliation, memory, HUD |
-| `web/persona.js` | The NPC's mind — system prompt builder, action list, behavior rules (obedience, hit escalation, psycho mode, dev-therapist voice) |
+| `web/persona.js` | Agent's mind — system prompt builder, action list, behavior rules (obedience, hit escalation, psycho mode, dev-therapist voice) |
+| `web/chopper-persona.mjs` | Chopper's separate powered prompt, action whitelist, observation boundary, and deterministic fallback lines |
+| `web/pet-controller.mjs` | Chopper's deterministic state, movement intent, reactions, car state, and persistence boundary |
 | `web/index.html` | UI shell: HUD, meters, panels, overlays, importmap |
 | `server.py` | `/chat` (backend chain + sanitizer), `/tts` (ElevenLabs + cache), static serving, `.env` loader |
 | `web/assets/anim/` | Ready Player Me mocap library (CC), retargeted onto any rig at boot |

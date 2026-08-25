@@ -8,6 +8,10 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { NPC_NAME, ACTIONS, setNpcName, buildSystemPrompt } from './persona.js';
+import {
+  CHOPPER_ACTIONS, CHOPPER_NAME, buildChopperSystemPrompt,
+  chopperFallbackReply, isSupportedChopperAction,
+} from './chopper-persona.mjs';
 import { pickPreferredVoice } from './voice-utils.js';
 import {
   normalizeMemory, normalizeSettings, sanitizeStoredName, storageGet, storageJson, storageSet,
@@ -34,7 +38,8 @@ const CFG = {
   punchRange: 1.9,
   petWalk: 2.8,
   petRun: 4.8,
-  petRadius: 0.24,
+  petRadius: 0.3,
+  petHeight: 1.35,
   gravity: -14,
   // If a character walks backwards, flip its offset by Math.PI.
   modelYaw: { player: 0, npc: Math.PI }, // player=Xbot(+Z), npc=Soldier(-Z)
@@ -1343,7 +1348,7 @@ savePetState();
 function updatePetBar() {
   if (!petBarEl || !petControllerState) return;
   const state = petControllerState.inCar ? 'car' : petControllerState.state;
-  const hint = petControllerState.visible ? 'B dismiss · chat “stay/come”' : 'B summon';
+  const hint = petControllerState.visible ? 'B dismiss · chat “Chopper, ...”' : 'B summon';
   petBarEl.textContent = `🐾 ${petControllerState.name} · ${state} · ${petControllerState.mood} · ${hint}`;
 }
 
@@ -2560,6 +2565,10 @@ function playChopperIntroduction() {
     logLine('sys', '(Chopper introduction audio could not start; the pet can still play normally.)');
   }
 }
+function stopChopperIntroduction() {
+  if (!chopperIntroAudio) return;
+  try { chopperIntroAudio.pause(); chopperIntroAudio.currentTime = 0; } catch { /* noop */ }
+}
 function footstep(run) {
   if (!audioCtx || !stepBuf) return;
   const src = audioCtx.createBufferSource();
@@ -2753,10 +2762,12 @@ function pickVoice() {
 if ('speechSynthesis' in window) {
   setTimeout(() => pickVoice(), 100); // async voice load
   speechSynthesis.addEventListener('voiceschanged', pickVoice);
+  speechSynthesis.addEventListener('voiceschanged', pickChopperVoice);
 }
 
 let sayAvailable = false;  // macOS `say` server voice — set from /health at boot
 let currentAudio = null;   // the <audio> playing a server-synthesized line
+let chopperVoice = null;
 function stopSpeaking() {
   speechSynthesis?.cancel?.();
   if (currentAudio) { try { currentAudio.pause(); } catch { /* noop */ } currentAudio = null; }
@@ -2942,6 +2953,8 @@ let modelLabel = 'no model';
 let npcDisplayName = 'Agent';
 let bootModelId = '';
 let gameMinutes = 19 * 60 + 40;
+let chopperHistory = [];
+let chopperBrainBusy = false;
 
 // M5 onboarding: he asks your name on first meeting; the next short,
 // non-command reply is taken as the answer (scripted — no LLM round-trip).
@@ -3081,6 +3094,40 @@ function petCommandFromText(text) {
   return null;
 }
 
+function pickChopperVoice() {
+  if (!('speechSynthesis' in window)) return null;
+  const voices = speechSynthesis.getVoices?.() || [];
+  const otherVoices = voices.filter((voice) => voice && voice !== chosenVoiceEn);
+  const english = otherVoices.filter((voice) => /^en(?:[-_]|$)/i.test(String(voice.lang || '')));
+  chopperVoice = english.find((voice) => /samantha|karen|moira|tessa|junior|child|cute/i.test(voice.name))
+    || english[0] || otherVoices[0] || chosenVoiceEn || voices[0] || null;
+  return chopperVoice;
+}
+
+function speakChopperBrowser(toSpeak) {
+  if (!('speechSynthesis' in window)) {
+    logLine('sys', '(this browser has no speech synthesis — Chopper remains text-only)');
+    return;
+  }
+  if (!chopperVoice) pickChopperVoice();
+  const utterance = new SpeechSynthesisUtterance(toSpeak);
+  utterance.voice = chopperVoice;
+  utterance.lang = 'en-IN';
+  utterance.rate = 1.02;
+  utterance.pitch = 1.34;
+  utterance.volume = settings.volume ?? 1;
+  try { speechSynthesis.speak(utterance); } catch { logLine('sys', '(Chopper voice could not start)'); }
+}
+
+function speakChopper(text) {
+  if (!voiceOn) return;
+  const clean = String(text || '').replace(/\*[^*]*\*/g, '').trim().slice(0, 600);
+  if (!clean) return;
+  stopChopperIntroduction();
+  stopSpeaking();
+  speakChopperBrowser(clean);
+}
+
 // "jump 4 times" / "jump twice" / "chaar baar kood" → jump:<n>
 const NUM_WORDS = { two: 2, twice: 2, three: 3, thrice: 3, four: 4, five: 5, do: 2, teen: 3, chaar: 4, char: 4, paanch: 5, 'दो': 2, 'तीन': 3, 'चार': 4, 'पांच': 5, 'पाँच': 5 };
 function commandFromText(text) {
@@ -3189,7 +3236,119 @@ function scrubSceneLeak(text) {
   return kept || text;
 }
 
+function isChopperAddressed(text) {
+  const input = String(text || '').trim();
+  const directAddress = /\bchopper\b/i.test(input) || /^(?:the\s+)?pet\b/i.test(input);
+  return directAddress || Boolean(petCommandFromText(input));
+}
+
+function chopperObservation() {
+  const state = petControllerState.inCar ? 'car' : petControllerState.state;
+  const distance = pet?.group && player?.group
+    ? pet.group.position.distanceTo(player.group.position).toFixed(1)
+    : 'unknown';
+  return [
+    `Chopper state: ${state}; visible: ${petControllerState.visible}; mood: ${petControllerState.mood}.`,
+    `Distance from player: ${distance}m; Falcon occupied: ${car.inCar}.`,
+    `Agent mood: ${Math.round(mood.happiness)}/10; player is ${seen.activity}.`,
+  ].join('\n');
+}
+
+function resetChopperHistory() {
+  chopperHistory = [{
+    role: 'system',
+    content: buildChopperSystemPrompt(bootModelId || modelLabel, chopperObservation()),
+  }];
+}
+
+function showChopperDialogue(say, secs = 5) {
+  const safe = String(say || '').slice(0, 1200);
+  logLine('n', `${CHOPPER_NAME}: ${safe}`);
+  if (petControllerState.visible) showPetBubble(safe, secs);
+}
+
+function applyChopperAction(action) {
+  const normalized = String(action || 'none').toLowerCase().trim();
+  if (!isSupportedChopperAction(normalized)) {
+    logLine('sys', `(ignored unsupported Chopper action: ${normalized || 'empty'})`);
+    return false;
+  }
+  if (isSupportedPetCommand(normalized)) return applyPetCommand(normalized);
+  if (!pet?.group || !petControllerState.visible) return normalized === 'none';
+  const now = performance.now();
+  if (normalized === 'sleep') {
+    petRuntime.route = [];
+    petRuntime.after = null;
+    petRuntime.sleepyAcc = 12;
+    petControllerState = setPetRuntimeState(petControllerState, 'sleepy');
+  } else if (normalized === 'bounce') {
+    petRuntime.gesture = 'bounce';
+    petRuntime.gestureUntil = now + 1100;
+    petRuntime.vy = Math.max(petRuntime.vy, 3.8);
+  } else if (normalized === 'wave') {
+    petRuntime.gesture = 'wave';
+    petRuntime.gestureUntil = now + 1800;
+  } else if (normalized === 'react') {
+    petRuntime.gesture = 'react';
+    petRuntime.gestureUntil = now + 1200;
+  }
+  persistPetControllerState();
+  return true;
+}
+
+async function sendToChopper(text) {
+  if (chopperBrainBusy) {
+    logLine('sys', '(Chopper is still talking — try again in a moment)');
+    return;
+  }
+  const userText = String(text || '').trim();
+  if (!userText) return;
+  chopperBrainBusy = true;
+  const command = petCommandFromText(userText);
+  if (command) applyPetCommand(command);
+  if (petControllerState.visible) petReact('chat');
+  statusEl.textContent = `${CHOPPER_NAME} is thinking…`;
+  if (!chopperHistory.length) resetChopperHistory();
+  const historyBeforeTurn = chopperHistory.slice();
+  chopperHistory.push({ role: 'user', content: `${chopperObservation()}\n${userText}` });
+  if (chopperHistory.length > 12) chopperHistory.splice(1, chopperHistory.length - 12);
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity: 'chopper', messages: chopperHistory }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    let { say, action, mood: replyMood } = parseReply(data.reply);
+    if (!isSupportedChopperAction(action)) {
+      logLine('sys', `(ignored unsupported Chopper action: ${action || 'empty'})`);
+      action = 'none';
+    }
+    chopperHistory.push({ role: 'assistant', content: JSON.stringify({ say, action, mood: replyMood }) });
+    showChopperDialogue(say, Math.max(4, say.length * 0.07));
+    speakChopper(say);
+    if (action !== command) applyChopperAction(action);
+    statusEl.textContent = replyMood ? `${modelLabel} · Chopper feels ${replyMood}` : modelLabel;
+  } catch (error) {
+    chopperHistory = historyBeforeTurn;
+    const fallback = chopperFallbackReply(userText, { command });
+    showChopperDialogue(fallback.say, 4);
+    speakChopper(fallback.say);
+    if (fallback.action !== command) applyChopperAction(fallback.action);
+    logLine('sys', `(Chopper brain fallback: ${String(error.message || error).slice(0, 160)})`);
+    statusEl.textContent = modelLabel;
+  } finally {
+    chopperBrainBusy = false;
+    if (chatOpen) chatInput.focus();
+  }
+}
+
 async function sendToBrain(text, _lastUserText) {
+  const routedUserText = _lastUserText || text;
+  if (!text.startsWith('[') && isChopperAddressed(routedUserText)) {
+    return sendToChopper(routedUserText);
+  }
   if (brainBusy) return;
   if (performance.now() < npcState.koUntil) {
     logLine('sys', "(he's rebooting — nobody's home right now)");
@@ -3212,7 +3371,7 @@ async function sendToBrain(text, _lastUserText) {
   const displayName = npcDisplayName || NPC_NAME;
   statusEl.textContent = `${displayName} is thinking…`;
   chatSend.disabled = true;
-  const userText = _lastUserText || text;
+  const userText = routedUserText;
   const petCommand = text.startsWith('[') ? null : petCommandFromText(userText);
   if (petCommand) applyPetCommand(petCommand);
   if (!text.startsWith('[')) petReact('chat');
@@ -3357,6 +3516,7 @@ function carSpot() {
 const petRuntime = {
   route: [], finalTarget: null, after: null, stuckAcc: 0, stuckCount: 0,
   lastPos: new THREE.Vector3(), followAge: 9, nextMoveReaction: 0, sleepyAcc: 0,
+  vy: 0, gesture: '', gestureUntil: 0,
 };
 const petPresentation = { phase: 0 };
 
@@ -3441,6 +3601,7 @@ function petEnterCar() {
   petControllerState.relationship.rides++;
   petRuntime.route = [];
   petRuntime.after = null;
+  petRuntime.vy = 0;
   pet.group.visible = true;
   pet.anim.gestureUntil = 0;
   persistPetControllerState();
@@ -3454,6 +3615,7 @@ function petExitCar() {
   petControllerState.inCar = false;
   const [x, z] = findClearNear(falconGroup.position.x - 2.5, falconGroup.position.z);
   pet.group.position.set(x, 0, z);
+  petRuntime.vy = 0;
   pet.group.visible = true;
   persistPetControllerState();
 }
@@ -3478,6 +3640,7 @@ function applyPetCommand(command) {
       const side = new THREE.Vector3(Math.cos(camYaw), 0, -Math.sin(camYaw));
       const [x, z] = findClearNear(player.group.position.x + side.x * 1.35, player.group.position.z + side.z * 1.35);
       pet.group.position.set(x, 0, z); pet.group.visible = true;
+      petRuntime.vy = 0; petRuntime.gesture = ''; petRuntime.gestureUntil = 0;
       petFaceToward(player.group.position, 1);
       petRuntime.route = []; petRuntime.after = null; petRuntime.followAge = 9; petRuntime.sleepyAcc = 0;
       break;
@@ -3548,6 +3711,15 @@ function updatePet(dt) {
   if (!pet?.group || !petControllerState.visible || petControllerState.inCar) return;
   const now = performance.now();
   const pPos = player.group.position;
+  petRuntime.vy += CFG.gravity * dt;
+  const nextY = pet.group.position.y + petRuntime.vy * dt;
+  if (nextY <= 0) {
+    if (petRuntime.vy < -4) footstep(false);
+    pet.group.position.y = 0;
+    petRuntime.vy = 0;
+  } else {
+    pet.group.position.y = nextY;
+  }
   const dToPlayer = pet.group.position.distanceTo(pPos);
   let moving = false;
   let speed = CFG.petWalk;
@@ -3607,9 +3779,16 @@ function updatePet(dt) {
 function updatePetPresentation(dt, moving) {
   if (!pet?.inner || !petControllerState.visible) return;
   petPresentation.phase += dt * (moving ? 8 : 2.2);
+  if (petRuntime.gestureUntil && performance.now() >= petRuntime.gestureUntil) {
+    petRuntime.gesture = '';
+    petRuntime.gestureUntil = 0;
+  }
   const bob = moving ? Math.abs(Math.sin(petPresentation.phase)) * 0.025 : Math.sin(petPresentation.phase) * 0.012;
-  pet.inner.position.y = bob;
+  const bounce = petRuntime.gesture === 'bounce' ? Math.abs(Math.sin(petPresentation.phase * 1.5)) * 0.08 : 0;
+  const wave = petRuntime.gesture === 'wave' ? Math.sin(petPresentation.phase * 2.2) * 0.12 : 0;
+  pet.inner.position.y = bob + bounce;
   pet.inner.rotation.x = petControllerState.state === 'sleepy' ? 0.28 : petControllerState.mood === 'worried' ? 0.08 : 0;
+  pet.inner.rotation.y = wave;
   pet.inner.rotation.z = petControllerState.state === 'sleepy' ? 0.03 : petControllerState.mood === 'happy' ? Math.sin(petPresentation.phase) * 0.035 : petControllerState.mood === 'worried' ? 0.06 : 0;
 }
 
