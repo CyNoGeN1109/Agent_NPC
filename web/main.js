@@ -2547,7 +2547,7 @@ function initAudio() {
 function playChopperIntroduction() {
   try {
     if (!chopperIntroAudio) {
-      chopperIntroAudio = new Audio('./assets/chopper.mp3');
+      chopperIntroAudio = new Audio('./assets/chopperfinal.mp3');
       chopperIntroAudio.preload = 'auto';
       chopperIntroAudio.addEventListener('error', () => {
         logLine('sys', '(Chopper introduction audio is unavailable; the pet can still play normally.)');
@@ -3307,6 +3307,13 @@ async function sendToChopper(text) {
   const command = petCommandFromText(userText);
   if (command) applyPetCommand(command);
   if (petControllerState.visible) petReact('chat');
+  if (command === 'summon') {
+    // Summoning has one consistent introduction: the bundled voice clip and
+    // the fixed bubble. Do not add a second model-generated greeting on top.
+    statusEl.textContent = modelLabel;
+    chopperBrainBusy = false;
+    return;
+  }
   statusEl.textContent = `${CHOPPER_NAME} is thinking…`;
   if (!chopperHistory.length) resetChopperHistory();
   const historyBeforeTurn = chopperHistory.slice();
@@ -3670,7 +3677,7 @@ function applyPetCommand(command) {
   persistPetControllerState();
   if (command === 'summon') {
     playChopperIntroduction();
-    showPetBubble('Chopper bounds over, ready to follow.', 3);
+    showPetBubble('Hi i am chopper hi team and and Sushmita', 4);
   }
   else if (command === 'dismiss') logLine('sys', '(Chopper trots off for a little break.)');
   else if (command === 'stay') showPetBubble('Chopper sits and stays.', 2.5);

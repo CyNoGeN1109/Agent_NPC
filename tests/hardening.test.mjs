@@ -265,10 +265,11 @@ test('model asset failure returns a safe fallback descriptor', () => {
 });
 
 test('Chopper summon introduction uses the bundled audio asset', () => {
-  const audioPath = new URL('../web/assets/chopper.mp3', import.meta.url);
+  const audioPath = new URL('../web/assets/chopperfinal.mp3', import.meta.url);
   const mainSource = fs.readFileSync(new URL('../web/main.js', import.meta.url), 'utf8');
   assert.ok(fs.statSync(audioPath).size > 0);
-  assert.match(mainSource, /new Audio\('\.\/assets\/chopper\.mp3'\)/);
+  assert.match(mainSource, /new Audio\('\.\/assets\/chopperfinal\.mp3'\)/);
+  assert.match(mainSource, /Hi i am chopper hi team and and Sushmita/);
   assert.match(mainSource, /if \(command === 'summon'\) \{[\s\S]*playChopperIntroduction\(\)/);
 });
 
